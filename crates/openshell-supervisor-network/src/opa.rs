@@ -2132,17 +2132,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 .binaries
                 .iter()
                 .flat_map(|b| {
-                    // The deprecated harness bit is ignored by policy YAML, but
-                    // advisor-generated proposals use it as internal provenance.
-                    #[allow(deprecated)]
-                    let advisor_proposed = b.harness;
-                    let binary_entry = |path: &str| {
-                        let mut entry = serde_json::json!({"path": path});
-                        if advisor_proposed {
-                            entry["advisor_proposed"] = true.into();
-                        }
-                        entry
-                    };
+                    let binary_entry = |path: &str| serde_json::json!({"path": path});
                     let mut entries = vec![binary_entry(&b.path)];
                     match resolve_binary_in_container(&b.path, entrypoint_pid) {
                         BinaryResolution::Resolved(resolved) => {
@@ -2284,7 +2274,6 @@ mod tests {
                 ],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/claude".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -2299,7 +2288,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/glab".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3396,7 +3384,6 @@ process:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3934,7 +3921,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4006,7 +3992,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4083,7 +4068,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5182,7 +5166,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5240,7 +5223,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5299,7 +5281,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/claude".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5360,7 +5341,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/aws".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5420,7 +5400,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5551,7 +5530,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5566,7 +5544,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/bash".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -6793,64 +6770,6 @@ network_policies:
     }
 
     #[test]
-    fn exact_declared_endpoint_host_false_for_advisor_proposed_binary() {
-        let mut network_policies = std::collections::HashMap::new();
-        let mut proposal_binary = NetworkBinary {
-            path: "/usr/bin/curl".to_string(),
-            ..Default::default()
-        };
-        #[allow(deprecated)]
-        {
-            proposal_binary.harness = true;
-        }
-        network_policies.insert(
-            "allow_mcp_internal_corp_example_com_8443".to_string(),
-            NetworkPolicyRule {
-                name: "allow_mcp_internal_corp_example_com_8443".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "mcp-internal.corp.example.com".to_string(),
-                    port: 8443,
-                    ..Default::default()
-                }],
-                binaries: vec![proposal_binary],
-            },
-        );
-        let proto = ProtoSandboxPolicy {
-            version: 1,
-            filesystem: Some(ProtoFs {
-                include_workdir: true,
-                read_only: vec![],
-                read_write: vec![],
-            }),
-            landlock: Some(openshell_core::proto::LandlockPolicy {
-                compatibility: "best_effort".to_string(),
-            }),
-            process: Some(ProtoProc {
-                run_as_user: "sandbox".to_string(),
-                run_as_group: "sandbox".to_string(),
-            }),
-            network_policies,
-            network_middlewares: std::collections::HashMap::default(),
-        };
-        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
-        let input = NetworkInput {
-            host: "mcp-internal.corp.example.com".into(),
-            port: 8443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "advisor proposal should still allow at OPA L4"
-        );
-        assert!(!engine.query_exact_declared_endpoint_host(&input).unwrap());
-    }
-
-    #[test]
     fn exact_declared_endpoint_host_false_for_advisor_proposed_endpoint() {
         let mut network_policies = std::collections::HashMap::new();
         network_policies.insert(
@@ -6866,7 +6785,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -6937,7 +6855,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -7168,7 +7085,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8145,7 +8061,6 @@ network_policies:
                     .iter()
                     .map(|p| NetworkBinary {
                         path: p.to_str().unwrap().to_string(),
-                        ..Default::default()
                     })
                     .collect(),
             },
@@ -8205,7 +8120,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8279,7 +8193,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8486,7 +8399,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8777,10 +8689,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: link_path }],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -8855,10 +8764,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: link_path }],
             },
         );
         let proto = ProtoSandboxPolicy {
