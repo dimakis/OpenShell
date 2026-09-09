@@ -618,7 +618,7 @@ sandbox_pids_limit = 2048
 
 ### Podman
 
-Sandboxes run as Podman containers on a user-mode bridge network. The supervisor image is mounted read-only via Podman's `type=image` mount; guest mTLS material is supplied as host paths.
+Each Podman sandbox has a workload container running `openshell-sandbox` with `network=none`, and a separate `openshell-supervisor` companion on the configured network. Both use non-root identities, drop all capabilities, and keep the runtime's default seccomp profile. A private named volume carries their authenticated gRPC Unix socket. Gateway JWTs, optional gateway mTLS material, and upstream proxy credentials are delivered only to the supervisor; user mounts and GPU devices stay with the workload.
 
 ```toml
 [openshell]
@@ -659,7 +659,8 @@ enable_bind_mounts      = false
 sandbox_pids_limit      = 2048
 # Health check interval in seconds. Lower values detect readiness faster
 # but increase process churn (each check spawns a conmon subprocess).
-# Set to 0 to disable health checks entirely. Default: 10.
+# Set to 0 to use a one-second check. Readiness checks cannot be disabled.
+# Default: 10.
 health_check_interval_secs = 10
 # User namespace mode for sandbox containers. Omit to use the default.
 # Supported modes: auto, host, keep-id, no-map, private.
@@ -670,7 +671,7 @@ health_check_interval_secs = 10
 # rootful Podman uses absolute host IDs (0:1000:1, 1:100000:65536).
 # uidmap                  = ["0:0:1", "1:1:65535"]
 # gidmap                  = ["0:0:1", "1:1:65535"]
-# Corporate forward proxy for sandbox egress. When set, the in-container
+# Corporate forward proxy for sandbox egress. When set, the external
 # supervisor chains policy-approved TLS tunnels through this proxy with HTTP
 # CONNECT instead of dialing destinations directly. Plain-HTTP requests are
 # not proxied and always dial the destination directly. http:// and https://
