@@ -124,9 +124,10 @@ async fn ssh_session_config(
             resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
         format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port)
     };
-    let gateway_name = tls
-        .gateway_name()
-        .ok_or_else(|| miette::miette!("gateway name is required to build SSH proxy command"))?;
+    // Direct-endpoint name mode does not have stored gateway metadata. The
+    // returned proxy command is unused by that path, but still needs a stable
+    // non-secret label while the session is assembled.
+    let gateway_name = ssh_proxy_gateway_name(tls);
     let proxy_command = build_proxy_command(
         &exe_command,
         &gateway_url,
@@ -142,6 +143,10 @@ async fn ssh_session_config(
         token: session.token,
         main_terminal: sandbox.spec.as_ref().is_none_or(|spec| spec.tty),
     })
+}
+
+fn ssh_proxy_gateway_name(tls: &TlsOptions) -> &str {
+    tls.gateway_name().unwrap_or("openshell")
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
@@ -1707,6 +1712,15 @@ pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) {
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
+
+    #[test]
+    fn direct_endpoint_ssh_uses_stable_gateway_label() {
+        let direct = TlsOptions::default();
+        assert_eq!(ssh_proxy_gateway_name(&direct), "openshell");
+
+        let named = direct.with_gateway_name("isolated");
+        assert_eq!(ssh_proxy_gateway_name(&named), "isolated");
+    }
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
