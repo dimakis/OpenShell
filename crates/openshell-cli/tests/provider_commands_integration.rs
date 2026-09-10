@@ -1374,6 +1374,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
         &ts.endpoint,
         "my-graph",
         Some("MS_GRAPH_ACCESS_TOKEN"),
+        "json",
         "default",
         &ts.tls,
     )

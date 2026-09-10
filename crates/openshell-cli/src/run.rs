@@ -4786,6 +4786,7 @@ pub async fn provider_refresh_status(
     server: &str,
     name: &str,
     credential_key: Option<&str>,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -4799,6 +4800,31 @@ pub async fn provider_refresh_status(
         .await
         .into_diagnostic()?
         .into_inner();
+
+    if output == "json" {
+        let credentials = response
+            .credentials
+            .iter()
+            .map(|status| {
+                serde_json::json!({
+                    "provider_name": status.provider_name,
+                    "provider_id": status.provider_id,
+                    "credential_key": status.credential_key,
+                    "status": status.status,
+                    "expires_at_ms": status.expires_at_ms,
+                    "next_refresh_at_ms": status.next_refresh_at_ms,
+                    "last_refresh_at_ms": status.last_refresh_at_ms,
+                    "refresh_generation_id": status.refresh_generation_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "credentials": credentials }))
+                .into_diagnostic()?
+        );
+        return Ok(());
+    }
 
     if response.credentials.is_empty() {
         if let Some(credential_key) = credential_key {

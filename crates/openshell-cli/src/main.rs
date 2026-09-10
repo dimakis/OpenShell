@@ -990,6 +990,10 @@ enum ProviderRefreshCommands {
         /// Optional credential key to filter by.
         #[arg(long = "credential-key")]
         credential_key: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Configure refresh metadata for a provider credential.
@@ -3504,11 +3508,13 @@ async fn run_async() -> Result<()> {
                     ProviderRefreshCommands::Status {
                         name,
                         credential_key,
+                        output,
                     } => {
                         run::provider_refresh_status(
                             endpoint,
                             &name,
                             credential_key.as_deref(),
+                            output.as_str(),
                             &cli.workspace,
                             &tls,
                         )
@@ -5010,7 +5016,8 @@ mod tests {
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Status {
                     name,
-                    credential_key: Some(key)
+                    credential_key: Some(key),
+                    output: OutputFormat::Table,
                 }))
             }) if name == "my-graph" && key == "MS_GRAPH_ACCESS_TOKEN"
         ));
