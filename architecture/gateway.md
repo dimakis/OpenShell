@@ -319,7 +319,12 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 276 messages, and 12 enums
-(`042034fe4d0000279ee4ed27e587ab8e530934b8d5c3aa36dc9769f81dfa6e51`).
+(`6e44eac9d4f76b8357eec91ceb5f18548136ba3bb88edfe0192968bf7a4296af`).
+The removed `NetworkBinary.harness` field remains reserved by number and name,
+so protobuf implementations cannot reuse its wire slot or source identifier.
+The durable-policy compatibility decoder reads the former boolean before Prost
+discards it and migrates advisor provenance to the rule endpoint. A fixed
+pre-0.1.0 policy payload verifies that the former wire format still decodes.
 
 Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server
@@ -335,7 +340,7 @@ Go, Python, and TypeScript client generation inputs do not advertise them.
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
 
 The 12 encoded durable roots above have a closure of 81 messages and eight
-enums (`920a5243dfb37ce709f0f562a47d17791a5ede90fd7f662ed01542abd60a0dfb`).
+enums (`369b36511c2e38b9df9621704a00123516c7538d8ee89a499158d7de5cee1882`).
 Its intersection with the public RPC closure contains 71 messages and eight
 enums (`05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415`).
 The descriptor-derived test owns these full inventories; the tables here record
