@@ -62,7 +62,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -301,6 +304,10 @@ pub struct ServerState {
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 
+    /// Set once graceful gateway shutdown begins so stream handlers can
+    /// distinguish expected transport closes from runtime failures.
+    pub(crate) gateway_shutting_down: AtomicBool,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -418,6 +425,7 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             provider_refresh_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            gateway_shutting_down: AtomicBool::new(false),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -809,6 +817,7 @@ pub(crate) async fn run_server(
 
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
+    state.gateway_shutting_down.store(true, Ordering::Release);
     let _ = shutdown_tx.send(true);
 
     for task in listener_tasks {
