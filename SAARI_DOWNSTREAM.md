@@ -25,7 +25,7 @@ flags and registered provider before it mutates a sandbox.
 
 Mitzo uses a separate downstream line based on upstream OpenShell `v0.0.116`:
 
-- immutable release: `saariuslystoned/OpenShell` at `v0.0.116-mitzo.1`
+- immutable release: `dimakis/OpenShell` at `v0.0.116-mitzo.1`
 - maintenance branch: `codex/mitzo-oauth-v0.0.116`
 - required provider name: `mitzo-personal-subscription`
 - required provider type: `openai-codex-oauth`
