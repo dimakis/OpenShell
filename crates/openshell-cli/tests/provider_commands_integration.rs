@@ -751,6 +751,10 @@ impl OpenShell for TestOpenShell {
             last_refresh_at_ms: 0,
             last_error: String::new(),
             refresh_generation_id: "mock-refresh-generation".to_string(),
+            recovery_action: 0,
+            failure_code: String::new(),
+            provider_error_subtype: String::new(),
+            last_error_at_ms: 0,
         };
         drop(providers);
         self.state
