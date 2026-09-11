@@ -25,7 +25,7 @@ flags and registered provider before it mutates a sandbox.
 
 Mitzo uses a separate downstream line based on upstream OpenShell `v0.0.116`:
 
-- immutable release: `dimakis/OpenShell` at `v0.0.116-mitzo.1`
+- immutable release: `dimakis/OpenShell` at `v0.0.116-mitzo.2`
 - maintenance branch: `codex/mitzo-oauth-v0.0.116`
 - required provider name: `mitzo-personal-subscription`
 - required provider type: `openai-codex-oauth`
@@ -35,6 +35,13 @@ routing that complement Mitzo's own broker-binding enforcement. Deploying the
 Mitzo application alone is insufficient: the gateway must run this downstream
 release (or a later explicitly validated port) for attended subscription login
 and credential-free sandbox inference to work.
+
+`v0.0.116-mitzo.2` supersedes `v0.0.116-mitzo.1`. The first port inserted its
+refresh-generation field at persisted protobuf field 18, shifting upstream
+0.0.116 fields 18-24 and making existing refresh records undecodable. The
+replacement preserves the complete upstream wire layout and allocates the new
+field at 25. Future ports must treat stored protobuf field numbers as immutable
+and run the production-state compatibility regression before rollout.
 
 Never replace this gateway with a stock OpenShell upgrade. Start each upgrade
 from the new immutable upstream tag, port the downstream commits, and prove the

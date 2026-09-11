@@ -6178,31 +6178,32 @@ type StoredProviderCredentialRefreshState struct {
 	// collision reservation, and env-key surfacing so later profile edits cannot
 	// silently redirect writes.
 	AdditionalOutputKeys map[string]string `protobuf:"bytes,17,rep,name=additional_output_keys,json=additionalOutputKeys,proto3" json:"additional_output_keys,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Opaque generation fence used by attended login/logout workflows.
-	RefreshGenerationId string `protobuf:"bytes,18,opt,name=refresh_generation_id,json=refreshGenerationId,proto3" json:"refresh_generation_id,omitempty"`
 	// Opaque gateway-owned authorization epoch for the configured refresh
 	// grant. Explicit refresh configuration creates a new epoch; automatic and
 	// manual token rotation preserve it. It is never derived from or exposed
 	// with refresh material.
-	AuthorizationEpoch string `protobuf:"bytes,19,opt,name=authorization_epoch,json=authorizationEpoch,proto3" json:"authorization_epoch,omitempty"`
+	AuthorizationEpoch string `protobuf:"bytes,18,opt,name=authorization_epoch,json=authorizationEpoch,proto3" json:"authorization_epoch,omitempty"`
 	// Secret refresh material is stored through the gateway's active credential
 	// driver. The persisted refresh state keeps only opaque handles; resolved
 	// values exist in gateway memory for the duration of one mint operation.
-	SecretMaterialHandles map[string]*datamodelv1.CredentialHandle `protobuf:"bytes,20,rep,name=secret_material_handles,json=secretMaterialHandles,proto3" json:"secret_material_handles,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	SecretMaterialHandles map[string]*datamodelv1.CredentialHandle `protobuf:"bytes,19,rep,name=secret_material_handles,json=secretMaterialHandles,proto3" json:"secret_material_handles,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Handles replaced by reconfiguration or issuer-driven refresh-token
 	// rotation. This is a repeated entry rather than a material-keyed map so
 	// multiple superseded generations of the same material remain recoverable.
 	// Cleanup is retried by the refresh worker so a gateway crash or temporary
 	// credential-backend outage does not lose the deletion reference.
-	PendingSecretDeletions []*StoredRefreshMaterialDeletion `protobuf:"bytes,21,rep,name=pending_secret_deletions,json=pendingSecretDeletions,proto3" json:"pending_secret_deletions,omitempty"`
+	PendingSecretDeletions []*StoredRefreshMaterialDeletion `protobuf:"bytes,20,rep,name=pending_secret_deletions,json=pendingSecretDeletions,proto3" json:"pending_secret_deletions,omitempty"`
 	// Structured recovery details for the most recent refresh failure. These
 	// fields contain only gateway-owned codes and recognized bounded values.
-	RecoveryAction       ProviderCredentialRefreshRecoveryAction `protobuf:"varint,22,opt,name=recovery_action,json=recoveryAction,proto3,enum=openshell.v1.ProviderCredentialRefreshRecoveryAction" json:"recovery_action,omitempty"`
-	FailureCode          string                                  `protobuf:"bytes,23,opt,name=failure_code,json=failureCode,proto3" json:"failure_code,omitempty"`
-	ProviderErrorSubtype string                                  `protobuf:"bytes,24,opt,name=provider_error_subtype,json=providerErrorSubtype,proto3" json:"provider_error_subtype,omitempty"`
-	LastErrorAtMs        int64                                   `protobuf:"varint,25,opt,name=last_error_at_ms,json=lastErrorAtMs,proto3" json:"last_error_at_ms,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	RecoveryAction       ProviderCredentialRefreshRecoveryAction `protobuf:"varint,21,opt,name=recovery_action,json=recoveryAction,proto3,enum=openshell.v1.ProviderCredentialRefreshRecoveryAction" json:"recovery_action,omitempty"`
+	FailureCode          string                                  `protobuf:"bytes,22,opt,name=failure_code,json=failureCode,proto3" json:"failure_code,omitempty"`
+	ProviderErrorSubtype string                                  `protobuf:"bytes,23,opt,name=provider_error_subtype,json=providerErrorSubtype,proto3" json:"provider_error_subtype,omitempty"`
+	LastErrorAtMs        int64                                   `protobuf:"varint,24,opt,name=last_error_at_ms,json=lastErrorAtMs,proto3" json:"last_error_at_ms,omitempty"`
+	// Opaque generation fence used by attended login/logout workflows. Field 25
+	// preserves the upstream 0.0.116 persisted wire layout at fields 18-24.
+	RefreshGenerationId string `protobuf:"bytes,25,opt,name=refresh_generation_id,json=refreshGenerationId,proto3" json:"refresh_generation_id,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *StoredProviderCredentialRefreshState) Reset() {
@@ -6354,13 +6355,6 @@ func (x *StoredProviderCredentialRefreshState) GetAdditionalOutputKeys() map[str
 	return nil
 }
 
-func (x *StoredProviderCredentialRefreshState) GetRefreshGenerationId() string {
-	if x != nil {
-		return x.RefreshGenerationId
-	}
-	return ""
-}
-
 func (x *StoredProviderCredentialRefreshState) GetAuthorizationEpoch() string {
 	if x != nil {
 		return x.AuthorizationEpoch
@@ -6408,6 +6402,13 @@ func (x *StoredProviderCredentialRefreshState) GetLastErrorAtMs() int64 {
 		return x.LastErrorAtMs
 	}
 	return 0
+}
+
+func (x *StoredProviderCredentialRefreshState) GetRefreshGenerationId() string {
+	if x != nil {
+		return x.RefreshGenerationId
+	}
+	return ""
 }
 
 type StoredRefreshMaterialDeletion struct {
@@ -14503,15 +14504,15 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06scopes\x18\x0e \x03(\tR\x06scopes\x124\n" +
 	"\x16refresh_before_seconds\x18\x0f \x01(\x03R\x14refreshBeforeSeconds\x120\n" +
 	"\x14max_lifetime_seconds\x18\x10 \x01(\x03R\x12maxLifetimeSeconds\x12\x82\x01\n" +
-	"\x16additional_output_keys\x18\x11 \x03(\v2L.openshell.v1.StoredProviderCredentialRefreshState.AdditionalOutputKeysEntryR\x14additionalOutputKeys\x122\n" +
-	"\x15refresh_generation_id\x18\x12 \x01(\tR\x13refreshGenerationId\x12/\n" +
-	"\x13authorization_epoch\x18\x13 \x01(\tR\x12authorizationEpoch\x12\x85\x01\n" +
-	"\x17secret_material_handles\x18\x14 \x03(\v2M.openshell.v1.StoredProviderCredentialRefreshState.SecretMaterialHandlesEntryR\x15secretMaterialHandles\x12e\n" +
-	"\x18pending_secret_deletions\x18\x15 \x03(\v2+.openshell.v1.StoredRefreshMaterialDeletionR\x16pendingSecretDeletions\x12^\n" +
-	"\x0frecovery_action\x18\x16 \x01(\x0e25.openshell.v1.ProviderCredentialRefreshRecoveryActionR\x0erecoveryAction\x12!\n" +
-	"\ffailure_code\x18\x17 \x01(\tR\vfailureCode\x124\n" +
-	"\x16provider_error_subtype\x18\x18 \x01(\tR\x14providerErrorSubtype\x12'\n" +
-	"\x10last_error_at_ms\x18\x19 \x01(\x03R\rlastErrorAtMs\x1a;\n" +
+	"\x16additional_output_keys\x18\x11 \x03(\v2L.openshell.v1.StoredProviderCredentialRefreshState.AdditionalOutputKeysEntryR\x14additionalOutputKeys\x12/\n" +
+	"\x13authorization_epoch\x18\x12 \x01(\tR\x12authorizationEpoch\x12\x85\x01\n" +
+	"\x17secret_material_handles\x18\x13 \x03(\v2M.openshell.v1.StoredProviderCredentialRefreshState.SecretMaterialHandlesEntryR\x15secretMaterialHandles\x12e\n" +
+	"\x18pending_secret_deletions\x18\x14 \x03(\v2+.openshell.v1.StoredRefreshMaterialDeletionR\x16pendingSecretDeletions\x12^\n" +
+	"\x0frecovery_action\x18\x15 \x01(\x0e25.openshell.v1.ProviderCredentialRefreshRecoveryActionR\x0erecoveryAction\x12!\n" +
+	"\ffailure_code\x18\x16 \x01(\tR\vfailureCode\x124\n" +
+	"\x16provider_error_subtype\x18\x17 \x01(\tR\x14providerErrorSubtype\x12'\n" +
+	"\x10last_error_at_ms\x18\x18 \x01(\x03R\rlastErrorAtMs\x122\n" +
+	"\x15refresh_generation_id\x18\x19 \x01(\tR\x13refreshGenerationId\x1a;\n" +
 	"\rMaterialEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aG\n" +

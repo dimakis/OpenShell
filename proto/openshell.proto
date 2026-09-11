@@ -1682,29 +1682,30 @@ message StoredProviderCredentialRefreshState {
   // collision reservation, and env-key surfacing so later profile edits cannot
   // silently redirect writes.
   map<string, string> additional_output_keys = 17;
-  // Opaque generation fence used by attended login/logout workflows.
-  string refresh_generation_id = 18;
   // Opaque gateway-owned authorization epoch for the configured refresh
   // grant. Explicit refresh configuration creates a new epoch; automatic and
   // manual token rotation preserve it. It is never derived from or exposed
   // with refresh material.
-  string authorization_epoch = 19;
+  string authorization_epoch = 18;
   // Secret refresh material is stored through the gateway's active credential
   // driver. The persisted refresh state keeps only opaque handles; resolved
   // values exist in gateway memory for the duration of one mint operation.
-  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 20;
+  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 19;
   // Handles replaced by reconfiguration or issuer-driven refresh-token
   // rotation. This is a repeated entry rather than a material-keyed map so
   // multiple superseded generations of the same material remain recoverable.
   // Cleanup is retried by the refresh worker so a gateway crash or temporary
   // credential-backend outage does not lose the deletion reference.
-  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 21;
+  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
   // Structured recovery details for the most recent refresh failure. These
   // fields contain only gateway-owned codes and recognized bounded values.
-  ProviderCredentialRefreshRecoveryAction recovery_action = 22;
-  string failure_code = 23;
-  string provider_error_subtype = 24;
-  int64 last_error_at_ms = 25;
+  ProviderCredentialRefreshRecoveryAction recovery_action = 21;
+  string failure_code = 22;
+  string provider_error_subtype = 23;
+  int64 last_error_at_ms = 24;
+  // Opaque generation fence used by attended login/logout workflows. Field 25
+  // preserves the upstream 0.0.116 persisted wire layout at fields 18-24.
+  string refresh_generation_id = 25;
 }
 
 message StoredRefreshMaterialDeletion {

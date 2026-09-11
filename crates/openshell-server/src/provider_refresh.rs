@@ -3011,6 +3011,7 @@ mod tests {
         StoredProviderCredentialRefreshState,
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+    use prost::Message as _;
     use std::collections::HashMap;
     use wiremock::matchers::{body_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3036,6 +3037,40 @@ mod tests {
             refresh_state_name(provider_id, "Alex-API"),
             refresh_state_name(provider_id, "alex-api")
         );
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct UpstreamV0116RefreshStateFixture {
+        #[prost(string, tag = "18")]
+        authorization_epoch: String,
+        #[prost(map = "string, message", tag = "19")]
+        secret_material_handles: HashMap<String, CredentialHandle>,
+    }
+
+    #[test]
+    fn refresh_state_decodes_upstream_v0116_persisted_wire_fields() {
+        let fixture = UpstreamV0116RefreshStateFixture {
+            authorization_epoch: "upstream-authorization-epoch".to_string(),
+            secret_material_handles: HashMap::from([(
+                "refresh_token".to_string(),
+                CredentialHandle {
+                    driver: "db".to_string(),
+                    handle: "opaque-handle".to_string(),
+                    metadata: HashMap::new(),
+                },
+            )]),
+        };
+
+        let decoded =
+            StoredProviderCredentialRefreshState::decode(fixture.encode_to_vec().as_slice())
+                .expect("upstream 0.0.116 refresh state must remain decodable");
+
+        assert_eq!(decoded.authorization_epoch, fixture.authorization_epoch);
+        assert_eq!(
+            decoded.secret_material_handles,
+            fixture.secret_material_handles
+        );
+        assert!(decoded.refresh_generation_id.is_empty());
     }
 
     #[tokio::test]
