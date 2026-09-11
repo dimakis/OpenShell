@@ -109,12 +109,6 @@ const (
 	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS  ProviderCredentialRefreshStrategy = 4
 	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT ProviderCredentialRefreshStrategy = 5
 	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE        ProviderCredentialRefreshStrategy = 6
-	// OpenAI's public Codex/ChatGPT subscription OAuth refresh contract. The
-	// gateway pins the issuer/client and never accepts a caller-supplied token URL.
-	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH ProviderCredentialRefreshStrategy = 7
-	// xAI's experimental Grok subscription OAuth refresh contract. The gateway
-	// pins the issuer/client/scopes and never accepts caller-supplied authority.
-	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH ProviderCredentialRefreshStrategy = 8
 )
 
 // Enum value maps for ProviderCredentialRefreshStrategy.
@@ -127,8 +121,6 @@ var (
 		4: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS",
 		5: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT",
 		6: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE",
-		7: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH",
-		8: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH",
 	}
 	ProviderCredentialRefreshStrategy_value = map[string]int32{
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED":                0,
@@ -138,8 +130,6 @@ var (
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS":  4,
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT": 5,
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE":        6,
-		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH":         7,
-		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH":             8,
 	}
 )
 
@@ -1123,14 +1113,8 @@ type SandboxSpec struct {
 	// Portable resource requirements used by the gateway for driver selection
 	// and by drivers for provisioning.
 	ResourceRequirements *ResourceRequirements `protobuf:"bytes,9,opt,name=resource_requirements,json=resourceRequirements,proto3" json:"resource_requirements,omitempty"`
-	// Optional sandbox-local inference provider selection. When set, this exact
-	// provider must also appear in `providers`; it overrides the workspace route
-	// for this sandbox without consulting attachment order.
-	InferenceProvider string `protobuf:"bytes,12,opt,name=inference_provider,json=inferenceProvider,proto3" json:"inference_provider,omitempty"`
-	// Model paired with `inference_provider`. Both fields must be set together.
-	InferenceModel string `protobuf:"bytes,13,opt,name=inference_model,json=inferenceModel,proto3" json:"inference_model,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *SandboxSpec) Reset() {
@@ -1203,20 +1187,6 @@ func (x *SandboxSpec) GetResourceRequirements() *ResourceRequirements {
 		return x.ResourceRequirements
 	}
 	return nil
-}
-
-func (x *SandboxSpec) GetInferenceProvider() string {
-	if x != nil {
-		return x.InferenceProvider
-	}
-	return ""
-}
-
-func (x *SandboxSpec) GetInferenceModel() string {
-	if x != nil {
-		return x.InferenceModel
-	}
-	return ""
 }
 
 type ResourceRequirements struct {
@@ -5718,12 +5688,8 @@ type ProviderCredentialRefreshStatus struct {
 	NextRefreshAtMs int64                             `protobuf:"varint,7,opt,name=next_refresh_at_ms,json=nextRefreshAtMs,proto3" json:"next_refresh_at_ms,omitempty"`
 	LastRefreshAtMs int64                             `protobuf:"varint,8,opt,name=last_refresh_at_ms,json=lastRefreshAtMs,proto3" json:"last_refresh_at_ms,omitempty"`
 	LastError       string                            `protobuf:"bytes,9,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"`
-	// Opaque identity of this configured grant generation. Clients may use it to
-	// fence cleanup after a multi-step grant operation without receiving secret
-	// material. It changes whenever configure replaces a refresh grant.
-	RefreshGenerationId string `protobuf:"bytes,10,opt,name=refresh_generation_id,json=refreshGenerationId,proto3" json:"refresh_generation_id,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ProviderCredentialRefreshStatus) Reset() {
@@ -5819,13 +5785,6 @@ func (x *ProviderCredentialRefreshStatus) GetLastError() string {
 	return ""
 }
 
-func (x *ProviderCredentialRefreshStatus) GetRefreshGenerationId() string {
-	if x != nil {
-		return x.RefreshGenerationId
-	}
-	return ""
-}
-
 // Provider profile local discovery declaration.
 type ProviderProfileDiscovery struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -5895,12 +5854,13 @@ type StoredProviderCredentialRefreshState struct {
 	// collision reservation, and env-key surfacing so later profile edits cannot
 	// silently redirect writes.
 	AdditionalOutputKeys map[string]string `protobuf:"bytes,17,rep,name=additional_output_keys,json=additionalOutputKeys,proto3" json:"additional_output_keys,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Non-secret generation fence rotated on every successful configure. This is
-	// distinct from metadata.id because a reauthorization updates the existing
-	// stored object while replacing the remote grant it represents.
-	RefreshGenerationId string `protobuf:"bytes,18,opt,name=refresh_generation_id,json=refreshGenerationId,proto3" json:"refresh_generation_id,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Opaque gateway-owned authorization epoch for the configured refresh
+	// grant. Explicit refresh configuration creates a new epoch; automatic and
+	// manual token rotation preserve it. It is never derived from or exposed
+	// with refresh material.
+	AuthorizationEpoch string `protobuf:"bytes,18,opt,name=authorization_epoch,json=authorizationEpoch,proto3" json:"authorization_epoch,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *StoredProviderCredentialRefreshState) Reset() {
@@ -6052,9 +6012,9 @@ func (x *StoredProviderCredentialRefreshState) GetAdditionalOutputKeys() map[str
 	return nil
 }
 
-func (x *StoredProviderCredentialRefreshState) GetRefreshGenerationId() string {
+func (x *StoredProviderCredentialRefreshState) GetAuthorizationEpoch() string {
 	if x != nil {
-		return x.RefreshGenerationId
+		return x.AuthorizationEpoch
 	}
 	return ""
 }
@@ -6411,18 +6371,9 @@ type DeleteProviderRefreshRequest struct {
 	Provider      string                 `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
 	CredentialKey string                 `protobuf:"bytes,2,opt,name=credential_key,json=credentialKey,proto3" json:"credential_key,omitempty"`
 	// Workspace scope. Empty defaults to "default".
-	Workspace string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
-	// Revoke a supported OAuth grant at its pinned authority before deleting the
-	// local refresh state. Supported only by reviewed subscription OAuth
-	// strategies with pinned remote revocation authorities.
-	RevokeRemote bool `protobuf:"varint,4,opt,name=revoke_remote,json=revokeRemote,proto3" json:"revoke_remote,omitempty"`
-	// Remove the primary minted credential after successful revocation.
-	ClearCredential bool `protobuf:"varint,5,opt,name=clear_credential,json=clearCredential,proto3" json:"clear_credential,omitempty"`
-	// Optional optimistic fence. When set, deletion/revocation proceeds only if
-	// the current refresh state has this exact configured-grant generation.
-	ExpectedRefreshGenerationId string `protobuf:"bytes,6,opt,name=expected_refresh_generation_id,json=expectedRefreshGenerationId,proto3" json:"expected_refresh_generation_id,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	Workspace     string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DeleteProviderRefreshRequest) Reset() {
@@ -6476,34 +6427,11 @@ func (x *DeleteProviderRefreshRequest) GetWorkspace() string {
 	return ""
 }
 
-func (x *DeleteProviderRefreshRequest) GetRevokeRemote() bool {
-	if x != nil {
-		return x.RevokeRemote
-	}
-	return false
-}
-
-func (x *DeleteProviderRefreshRequest) GetClearCredential() bool {
-	if x != nil {
-		return x.ClearCredential
-	}
-	return false
-}
-
-func (x *DeleteProviderRefreshRequest) GetExpectedRefreshGenerationId() string {
-	if x != nil {
-		return x.ExpectedRefreshGenerationId
-	}
-	return ""
-}
-
 type DeleteProviderRefreshResponse struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	Deleted           bool                   `protobuf:"varint,1,opt,name=deleted,proto3" json:"deleted,omitempty"`
-	RemoteRevoked     bool                   `protobuf:"varint,2,opt,name=remote_revoked,json=remoteRevoked,proto3" json:"remote_revoked,omitempty"`
-	CredentialCleared bool                   `protobuf:"varint,3,opt,name=credential_cleared,json=credentialCleared,proto3" json:"credential_cleared,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Deleted       bool                   `protobuf:"varint,1,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DeleteProviderRefreshResponse) Reset() {
@@ -6539,20 +6467,6 @@ func (*DeleteProviderRefreshResponse) Descriptor() ([]byte, []int) {
 func (x *DeleteProviderRefreshResponse) GetDeleted() bool {
 	if x != nil {
 		return x.Deleted
-	}
-	return false
-}
-
-func (x *DeleteProviderRefreshResponse) GetRemoteRevoked() bool {
-	if x != nil {
-		return x.RemoteRevoked
-	}
-	return false
-}
-
-func (x *DeleteProviderRefreshResponse) GetCredentialCleared() bool {
-	if x != nil {
-		return x.CredentialCleared
 	}
 	return false
 }
@@ -7481,8 +7395,14 @@ type StaticCredentialBinding struct {
 	// Supervisors use it to retain old revision placeholders only across
 	// rotations of the same provider credential.
 	CredentialIdentity string `protobuf:"bytes,2,opt,name=credential_identity,json=credentialIdentity,proto3" json:"credential_identity,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Opaque gateway-issued handle for a refresh-managed credential identity
+	// epoch. When non-empty, supervisors keep the workload placeholder stable
+	// across access-token rotations and replace only the resolver value. The
+	// handle changes when the sandbox, provider, credential key, refresh
+	// authorization epoch, or endpoint authorization boundary changes.
+	WorkloadCredentialHandle string `protobuf:"bytes,3,opt,name=workload_credential_handle,json=workloadCredentialHandle,proto3" json:"workload_credential_handle,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *StaticCredentialBinding) Reset() {
@@ -7525,6 +7445,13 @@ func (x *StaticCredentialBinding) GetEndpoints() []*StaticCredentialEndpointBind
 func (x *StaticCredentialBinding) GetCredentialIdentity() string {
 	if x != nil {
 		return x.CredentialIdentity
+	}
+	return ""
+}
+
+func (x *StaticCredentialBinding) GetWorkloadCredentialHandle() string {
+	if x != nil {
+		return x.WorkloadCredentialHandle
 	}
 	return ""
 }
@@ -13208,16 +13135,14 @@ const file_openshell_proto_rawDesc = "" +
 	"\aSandbox\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12-\n" +
 	"\x04spec\x18\x02 \x01(\v2\x19.openshell.v1.SandboxSpecR\x04spec\x123\n" +
-	"\x06status\x18\x03 \x01(\v2\x1b.openshell.v1.SandboxStatusR\x06statusJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\x05phaseR\x16current_policy_version\"\xaf\x04\n" +
+	"\x06status\x18\x03 \x01(\v2\x1b.openshell.v1.SandboxStatusR\x06statusJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\x05phaseR\x16current_policy_version\"\xd7\x03\n" +
 	"\vSandboxSpec\x12\x1b\n" +
 	"\tlog_level\x18\x01 \x01(\tR\blogLevel\x12L\n" +
 	"\venvironment\x18\x05 \x03(\v2*.openshell.v1.SandboxSpec.EnvironmentEntryR\venvironment\x129\n" +
 	"\btemplate\x18\x06 \x01(\v2\x1d.openshell.v1.SandboxTemplateR\btemplate\x12;\n" +
 	"\x06policy\x18\a \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x1c\n" +
 	"\tproviders\x18\b \x03(\tR\tproviders\x12W\n" +
-	"\x15resource_requirements\x18\t \x01(\v2\".openshell.v1.ResourceRequirementsR\x14resourceRequirements\x12-\n" +
-	"\x12inference_provider\x18\f \x01(\tR\x11inferenceProvider\x12'\n" +
-	"\x0finference_model\x18\r \x01(\tR\x0einferenceModel\x1a>\n" +
+	"\x15resource_requirements\x18\t \x01(\v2\".openshell.v1.ResourceRequirementsR\x14resourceRequirements\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\n" +
@@ -13567,7 +13492,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x16refresh_before_seconds\x18\x04 \x01(\x03R\x14refreshBeforeSeconds\x120\n" +
 	"\x14max_lifetime_seconds\x18\x05 \x01(\x03R\x12maxLifetimeSeconds\x12K\n" +
 	"\bmaterial\x18\x06 \x03(\v2/.openshell.v1.ProviderCredentialRefreshMaterialR\bmaterial\x12\\\n" +
-	"\x12additional_outputs\x18\a \x03(\v2-.openshell.v1.ProviderCredentialRefreshOutputR\x11additionalOutputs\"\xc4\x03\n" +
+	"\x12additional_outputs\x18\a \x03(\v2-.openshell.v1.ProviderCredentialRefreshOutputR\x11additionalOutputs\"\x90\x03\n" +
 	"\x1fProviderCredentialRefreshStatus\x12#\n" +
 	"\rprovider_name\x18\x01 \x01(\tR\fproviderName\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
@@ -13579,11 +13504,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\x12next_refresh_at_ms\x18\a \x01(\x03R\x0fnextRefreshAtMs\x12+\n" +
 	"\x12last_refresh_at_ms\x18\b \x01(\x03R\x0flastRefreshAtMs\x12\x1d\n" +
 	"\n" +
-	"last_error\x18\t \x01(\tR\tlastError\x122\n" +
-	"\x15refresh_generation_id\x18\n" +
-	" \x01(\tR\x13refreshGenerationId\"<\n" +
+	"last_error\x18\t \x01(\tR\tlastError\"<\n" +
 	"\x18ProviderProfileDiscovery\x12 \n" +
-	"\vcredentials\x18\x01 \x03(\tR\vcredentials\"\xc7\b\n" +
+	"\vcredentials\x18\x01 \x03(\tR\vcredentials\"\xc4\b\n" +
 	"$StoredProviderCredentialRefreshState\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
@@ -13604,8 +13527,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06scopes\x18\x0e \x03(\tR\x06scopes\x124\n" +
 	"\x16refresh_before_seconds\x18\x0f \x01(\x03R\x14refreshBeforeSeconds\x120\n" +
 	"\x14max_lifetime_seconds\x18\x10 \x01(\x03R\x12maxLifetimeSeconds\x12\x82\x01\n" +
-	"\x16additional_output_keys\x18\x11 \x03(\v2L.openshell.v1.StoredProviderCredentialRefreshState.AdditionalOutputKeysEntryR\x14additionalOutputKeys\x122\n" +
-	"\x15refresh_generation_id\x18\x12 \x01(\tR\x13refreshGenerationId\x1a;\n" +
+	"\x16additional_output_keys\x18\x11 \x03(\v2L.openshell.v1.StoredProviderCredentialRefreshState.AdditionalOutputKeysEntryR\x14additionalOutputKeys\x12/\n" +
+	"\x13authorization_epoch\x18\x12 \x01(\tR\x12authorizationEpoch\x1a;\n" +
 	"\rMaterialEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aG\n" +
@@ -13637,18 +13560,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12\x1c\n" +
 	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"i\n" +
 	" RotateProviderCredentialResponse\x12E\n" +
-	"\x06status\x18\x01 \x01(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\x06status\"\x94\x02\n" +
+	"\x06status\x18\x01 \x01(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\x06status\"\x7f\n" +
 	"\x1cDeleteProviderRefreshRequest\x12\x1a\n" +
 	"\bprovider\x18\x01 \x01(\tR\bprovider\x12%\n" +
 	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12\x1c\n" +
-	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12#\n" +
-	"\rrevoke_remote\x18\x04 \x01(\bR\frevokeRemote\x12)\n" +
-	"\x10clear_credential\x18\x05 \x01(\bR\x0fclearCredential\x12C\n" +
-	"\x1eexpected_refresh_generation_id\x18\x06 \x01(\tR\x1bexpectedRefreshGenerationId\"\x8f\x01\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"9\n" +
 	"\x1dDeleteProviderRefreshResponse\x12\x18\n" +
-	"\adeleted\x18\x01 \x01(\bR\adeleted\x12%\n" +
-	"\x0eremote_revoked\x18\x02 \x01(\bR\rremoteRevoked\x12-\n" +
-	"\x12credential_cleared\x18\x03 \x01(\bR\x11credentialCleared\"\xd8\x05\n" +
+	"\adeleted\x18\x01 \x01(\bR\adeleted\"\xd8\x05\n" +
 	"\x0fProviderProfile\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12!\n" +
 	"\fdisplay_name\x18\x02 \x01(\tR\vdisplayName\x12 \n" +
@@ -13710,10 +13628,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\x1fStaticCredentialEndpointBinding\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\"\x97\x01\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"\xd5\x01\n" +
 	"\x17StaticCredentialBinding\x12K\n" +
 	"\tendpoints\x18\x01 \x03(\v2-.openshell.v1.StaticCredentialEndpointBindingR\tendpoints\x12/\n" +
-	"\x13credential_identity\x18\x02 \x01(\tR\x12credentialIdentity\"\x90\b\n" +
+	"\x13credential_identity\x18\x02 \x01(\tR\x12credentialIdentity\x12<\n" +
+	"\x1aworkload_credential_handle\x18\x03 \x01(\tR\x18workloadCredentialHandle\"\x90\b\n" +
 	"%GetSandboxProviderEnvironmentResponse\x12l\n" +
 	"\venvironment\x18\x01 \x03(\v2D.openshell.v1.GetSandboxProviderEnvironmentResponse.EnvironmentEntryB\x04\x88\xb5\x18\x01R\venvironment\x122\n" +
 	"\x15provider_env_revision\x18\x02 \x01(\x04R\x13providerEnvRevision\x12\x87\x01\n" +
@@ -14184,7 +14103,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x15SANDBOX_PHASE_UNKNOWN\x10\x05\x12\x1a\n" +
 	"\x16SANDBOX_PHASE_STOPPING\x10\x06\x12\x19\n" +
 	"\x15SANDBOX_PHASE_STOPPED\x10\a\x12\x1a\n" +
-	"\x16SANDBOX_PHASE_STARTING\x10\b*\xb9\x04\n" +
+	"\x16SANDBOX_PHASE_STARTING\x10\b*\xc3\x03\n" +
 	"!ProviderCredentialRefreshStrategy\x124\n" +
 	"0PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED\x10\x00\x12/\n" +
 	"+PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC\x10\x01\x121\n" +
@@ -14192,9 +14111,7 @@ const file_openshell_proto_rawDesc = "" +
 	"9PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN\x10\x03\x12B\n" +
 	">PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS\x10\x04\x12C\n" +
 	"?PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT\x10\x05\x12<\n" +
-	"8PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE\x10\x06\x12;\n" +
-	"7PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH\x10\a\x127\n" +
-	"3PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH\x10\b*\xdb\x02\n" +
+	"8PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE\x10\x06*\xdb\x02\n" +
 	"\x17ProviderProfileCategory\x12)\n" +
 	"%PROVIDER_PROFILE_CATEGORY_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fPROVIDER_PROFILE_CATEGORY_OTHER\x10\x01\x12'\n" +
