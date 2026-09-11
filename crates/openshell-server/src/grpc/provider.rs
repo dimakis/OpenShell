@@ -529,33 +529,11 @@ pub(super) async fn delete_provider_record(
     workspace: &str,
     name: &str,
 ) -> Result<bool, Status> {
-    if name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-
-    let Some(provider) = store
-        .get_message_by_name::<Provider>(workspace, name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
-    else {
-        return Ok(false);
-    };
-
-    let blocking_sandboxes = sandboxes_using_provider(store, workspace, name).await?;
-    if !blocking_sandboxes.is_empty() {
-        return Err(Status::failed_precondition(format!(
-            "provider '{name}' is attached to sandbox(es): {}",
-            blocking_sandboxes.join(", ")
-        )));
-    }
-
-    crate::provider_refresh::delete_refresh_states_for_provider(store, provider.object_id())
-        .await?;
-
-    store
-        .delete_by_name(Provider::object_type(), workspace, name)
-        .await
-        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
+    let credentials = crate::credentials::CredentialRuntime::from_config(
+        &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
+    )
+    .map_err(|err| Status::internal(format!("create test credential runtime failed: {err}")))?;
+    delete_provider_record_with_credentials(store, workspace, &credentials, name).await
 }
 
 pub(super) async fn delete_provider_record_with_credentials(
@@ -584,6 +562,13 @@ pub(super) async fn delete_provider_record_with_credentials(
         )));
     }
 
+    crate::provider_refresh::delete_refresh_states_for_provider_with_credentials(
+        store,
+        credentials,
+        provider.object_id(),
+    )
+    .await?;
+
     credentials
         .delete_provider_credential_handles(
             provider.object_name(),
@@ -591,9 +576,6 @@ pub(super) async fn delete_provider_record_with_credentials(
             provider.object_id(),
             &provider.credential_handles,
         )
-        .await?;
-
-    crate::provider_refresh::delete_refresh_states_for_provider(store, provider.object_id())
         .await?;
 
     store
@@ -2933,8 +2915,8 @@ fn validate_subscription_oauth_material(
 }
 
 fn refresh_configuration_matches(
-    existing: &openshell_core::proto::StoredProviderCredentialRefreshState,
-    proposed: &openshell_core::proto::StoredProviderCredentialRefreshState,
+    existing: &StoredProviderCredentialRefreshState,
+    proposed: &StoredProviderCredentialRefreshState,
 ) -> bool {
     let existing_secret_keys = existing
         .secret_material_keys
@@ -3868,6 +3850,25 @@ pub(super) async fn handle_configure_provider_refresh(
         &additional_output_keys,
     )?;
     validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
+    let mut secret_material_keys: HashSet<String> =
+        request.secret_material_keys.iter().cloned().collect();
+    if let Some(refresh) = refresh_defaults.as_ref() {
+        secret_material_keys.extend(
+            refresh
+                .material
+                .iter()
+                .filter(|item| item.secret && request.material.contains_key(&item.name))
+                .map(|item| item.name.clone()),
+        );
+    }
+    secret_material_keys.extend(
+        crate::provider_refresh::strategy_secret_material_keys(strategy)
+            .iter()
+            .filter(|key| request.material.contains_key(**key))
+            .map(|key| (*key).to_string()),
+    );
+    let mut secret_material_keys: Vec<_> = secret_material_keys.into_iter().collect();
+    secret_material_keys.sort();
     let material_scopes = crate::provider_refresh::material_scopes(&request.material);
     let token_url = refresh_defaults
         .as_ref()
@@ -3927,7 +3928,7 @@ pub(super) async fn handle_configure_provider_refresh(
         crate::provider_refresh::NewRefreshStateConfig {
             strategy,
             material: request.material,
-            secret_material_keys: request.secret_material_keys,
+            secret_material_keys,
             expires_at_ms,
             token_url,
             scopes,
@@ -3949,67 +3950,85 @@ pub(super) async fn handle_configure_provider_refresh(
             "subscription OAuth grant already exists; revoke it before replacing the refresh state",
         ));
     }
-    if let Some(existing) = existing_refresh_state {
-        let expected_version = existing
+    let secret_material: HashMap<_, _> = state_record
+        .secret_material_keys
+        .iter()
+        .filter_map(|key| {
+            state_record
+                .material
+                .remove(key)
+                .map(|value| (key.clone(), value))
+        })
+        .collect();
+    let existing_refresh_version = existing_refresh_state.as_ref().and_then(|existing| {
+        existing
             .metadata
             .as_ref()
-            .map_or(0, |metadata| metadata.resource_version);
-        state_record.metadata = existing.metadata;
+            .map(|metadata| metadata.resource_version)
+    });
+    if let Some(existing) = existing_refresh_state.as_ref() {
+        state_record.metadata.clone_from(&existing.metadata);
         state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
-        let Some(new_version) = crate::provider_refresh::persist_refresh_state_if_current(
+        state_record
+            .pending_secret_deletions
+            .extend(existing.pending_secret_deletions.clone());
+        for (material_key, handle) in &existing.secret_material_handles {
+            crate::provider_refresh::enqueue_pending_secret_deletion(
+                &mut state_record,
+                material_key,
+                handle.clone(),
+            );
+        }
+    }
+    let material_staging_id = format!(
+        "{}-refresh-config-{}",
+        provider.object_id(),
+        uuid::Uuid::new_v4()
+    );
+    let staged_material_handles = state
+        .credentials
+        .store_refresh_material_with_object_id(
+            crate::provider_refresh::refresh_material_scope(&state_record),
+            &material_staging_id,
+            &secret_material,
+            &HashMap::new(),
+        )
+        .await?;
+    state_record.secret_material_handles = staged_material_handles.clone();
+    let persist_result = if let Some(expected_version) = existing_refresh_version {
+        match crate::provider_refresh::replace_refresh_state_if_current(
             state.store.as_ref(),
             &state_record,
             expected_version,
         )
-        .await?
-        else {
-            if let Some(current) = crate::provider_refresh::get_refresh_state(
-                state.store.as_ref(),
-                &workspace,
-                provider.object_id(),
-                credential_key,
-            )
-            .await?
-                && refresh_configuration_matches(&current, &state_record)
-            {
-                return Ok(Response::new(ConfigureProviderRefreshResponse {
-                    status: Some(crate::provider_refresh::refresh_status_from_state(&current)),
-                }));
-            }
-            return Err(Status::aborted(
-                "provider refresh generation changed during configure; retry",
-            ));
-        };
-        if let Some(metadata) = state_record.metadata.as_mut() {
-            metadata.resource_version = new_version;
+        .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Status::aborted(
+                "provider refresh was concurrently modified during configuration",
+            )),
+            Err(err) => Err(err),
         }
     } else {
-        let Some(new_version) = crate::provider_refresh::create_refresh_state_if_absent(
-            state.store.as_ref(),
-            &state_record,
-        )
-        .await?
-        else {
-            if let Some(current) = crate::provider_refresh::get_refresh_state(
-                state.store.as_ref(),
-                &workspace,
-                provider.object_id(),
-                credential_key,
+        crate::provider_refresh::create_refresh_state(state.store.as_ref(), &state_record).await
+    };
+    if let Err(err) = persist_result {
+        if let Err(cleanup_err) = state
+            .credentials
+            .delete_refresh_material_handles(
+                crate::provider_refresh::refresh_material_scope(&state_record),
+                &staged_material_handles,
             )
-            .await?
-                && refresh_configuration_matches(&current, &state_record)
-            {
-                return Ok(Response::new(ConfigureProviderRefreshResponse {
-                    status: Some(crate::provider_refresh::refresh_status_from_state(&current)),
-                }));
-            }
-            return Err(Status::aborted(
-                "provider refresh generation was concurrently configured; retry",
-            ));
-        };
-        if let Some(metadata) = state_record.metadata.as_mut() {
-            metadata.resource_version = new_version;
+            .await
+        {
+            warn!(
+                provider_name = %provider.object_name(),
+                credential_key,
+                error = %cleanup_err,
+                "failed to clean up staged refresh material after configuration failure"
+            );
         }
+        return Err(err);
     }
 
     if let Some(expires_at_ms) = request.expires_at_ms {
@@ -4233,7 +4252,11 @@ pub(super) async fn handle_delete_provider_refresh(
         if let Some(metadata) = refresh_state.metadata.as_mut() {
             metadata.resource_version = claimed_version;
         }
-        if let Err(error) = crate::provider_refresh::revoke_subscription_oauth(refresh_state).await
+        if let Err(error) = crate::provider_refresh::revoke_subscription_oauth_with_credentials(
+            &state.credentials,
+            refresh_state,
+        )
+        .await
         {
             refresh_state.status = "revoke_failed".to_string();
             refresh_state.last_error = error.message().to_string();
@@ -4262,8 +4285,9 @@ pub(super) async fn handle_delete_provider_refresh(
     let deleted_before_cleanup = if request.revoke_remote {
         false
     } else {
-        crate::provider_refresh::delete_refresh_state(
+        crate::provider_refresh::delete_refresh_state_with_credentials(
             state.store.as_ref(),
+            &state.credentials,
             &workspace,
             provider.object_id(),
             credential_key,
@@ -4346,8 +4370,9 @@ pub(super) async fn handle_delete_provider_refresh(
     let deleted_refresh_state = if request.revoke_remote && existing_refresh_state.is_none() {
         missing_subscription_grant_is_converged
     } else if request.revoke_remote {
-        let deleted = crate::provider_refresh::delete_refresh_state(
+        let deleted = crate::provider_refresh::delete_refresh_state_with_credentials(
             state.store.as_ref(),
+            &state.credentials,
             &workspace,
             provider.object_id(),
             credential_key,

@@ -103,6 +103,10 @@ struct NetworkPolicyRuleDef {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint DTO mirrors independent policy schema toggles."
+)]
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
@@ -144,6 +148,10 @@ struct NetworkEndpointDef {
     /// placeholders before forwarding upstream. Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     request_body_credential_rewrite: bool,
+    /// Explicitly permits credentials on traffic paths that `OpenShell` cannot
+    /// inspect or rewrite. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_uninspected_credentials: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     persisted_queries: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -745,6 +753,10 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
+                            // Provider credential provenance is derived by the
+                            // gateway and cannot be authored in policy YAML.
+                            provider_credentialed: false,
                             // Advisor provenance is internal runtime state, not
                             // a user-authored policy schema field.
                             advisor_proposed: false,
@@ -901,6 +913,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
                             persisted_queries: e.persisted_queries.clone(),
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries
@@ -959,13 +972,24 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 // Sandbox UID/GID constants
 // ---------------------------------------------------------------------------
 
-/// Minimum accepted UID for sandbox process identity.
-/// UIDs below this are reserved for system users and are rejected.
-pub const MIN_SANDBOX_UID: u32 = 1000;
+/// Minimum accepted UID/GID for sandbox workload identity.
+///
+/// Linux reserves only identity `0` for root. Non-root system identities are
+/// valid workload identities when selected explicitly by the operator.
+pub const MIN_SANDBOX_UID: u32 = 1;
 
-/// Maximum accepted UID for sandbox process identity.
-/// UIDs above this exceed typical OS limits and are rejected.
-pub const MAX_SANDBOX_UID: u32 = 2_000_000_000;
+/// Maximum accepted UID/GID for sandbox workload identity.
+///
+/// `u32::MAX` represents an invalid or unchanged identity in Linux APIs and
+/// POSIX ACLs, so the largest usable workload identity is one less.
+pub const MAX_SANDBOX_UID: u32 = u32::MAX - 1;
+
+/// Minimum UID for the Kubernetes network proxy identity.
+///
+/// The proxy UID is exempt from the pod egress fence, so it remains in a
+/// dedicated infrastructure range even though workload identities may use
+/// non-root system IDs.
+pub const MIN_SANDBOX_PROXY_UID: u32 = 1000;
 
 /// The literal string value accepted as a valid sandbox user/group name.
 const SANDBOX_NAME: &str = "sandbox";
@@ -977,8 +1001,8 @@ const SANDBOX_NAME: &str = "sandbox";
 ///
 /// Rejects:
 /// - The empty string (represents an omitted policy field)
-/// - UID 0 or values below `MIN_SANDBOX_UID`
-/// - Values above `MAX_SANDBOX_UID`
+/// - UID/GID 0 (root)
+/// - `u32::MAX`, the invalid identity sentinel
 /// - Non-numeric strings other than `"sandbox"` (e.g. `"root"`, `"nobody"`)
 pub fn is_valid_sandbox_identity(value: &str) -> bool {
     if value == SANDBOX_NAME {
@@ -2786,7 +2810,11 @@ network_policies:
     }
 
     #[test]
-    fn valid_identity_accepts_numeric_uid_in_range() {
+    fn valid_identity_accepts_non_root_numeric_uid() {
+        assert!(is_valid_sandbox_identity("1"));
+        assert!(is_valid_sandbox_identity("30"));
+        assert!(is_valid_sandbox_identity("500"));
+        assert!(is_valid_sandbox_identity("999"));
         assert!(is_valid_sandbox_identity("1000"));
         assert!(is_valid_sandbox_identity("50000"));
         assert!(is_valid_sandbox_identity("1000660000"));
@@ -2804,14 +2832,7 @@ network_policies:
     }
 
     #[test]
-    fn valid_identity_rejects_system_uids_below_min() {
-        assert!(!is_valid_sandbox_identity("999"));
-        assert!(!is_valid_sandbox_identity("100"));
-        assert!(!is_valid_sandbox_identity("1"));
-    }
-
-    #[test]
-    fn valid_identity_rejects_uid_above_max() {
+    fn valid_identity_rejects_invalid_uid_sentinel() {
         assert!(!is_valid_sandbox_identity(
             &MAX_SANDBOX_UID.saturating_add(1).to_string()
         ));
@@ -2864,20 +2885,13 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_uid_out_of_range_low() {
+    fn validate_accepts_non_root_system_uid() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
             run_as_user: "500".into(),
-            run_as_group: "sandbox".into(),
+            run_as_group: "30".into(),
         });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations.iter().any(|v| matches!(
-            v,
-            PolicyViolation::InvalidProcessIdentity {
-                field: "run_as_user",
-                ..
-            }
-        )));
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
@@ -3487,6 +3501,32 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_allow_uninspected_credentials() {
+        let yaml = r"
+version: 1
+network_policies:
+  vendor_api:
+    endpoints:
+      - host: api.vendor.example
+        port: 443
+        tls: skip
+        allow_uninspected_credentials: true
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["vendor_api"].endpoints[0];
+        assert!(ep.allow_uninspected_credentials);
+        assert!(
+            !ep.provider_credentialed,
+            "provider provenance must not be authorable from policy YAML"
+        );
+        assert!(yaml_out.contains("allow_uninspected_credentials: true"));
+        assert!(!yaml_out.contains("provider_credentialed"));
+    }
+
+    #[test]
     fn websocket_credential_rewrite_defaults_false() {
         let yaml = r"
 version: 1
@@ -3504,6 +3544,8 @@ network_policies:
         let ep = &proto.network_policies["gateway"].endpoints[0];
         assert!(!ep.websocket_credential_rewrite);
         assert!(!ep.request_body_credential_rewrite);
+        assert!(!ep.allow_uninspected_credentials);
+        assert!(!ep.provider_credentialed);
     }
 
     #[test]

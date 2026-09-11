@@ -339,11 +339,12 @@ impl Store {
         ))
     }
 
-    /// Insert a scoped object only when its workspace/name identity is absent.
+    /// Atomically insert a generic named object with an application-owned scope.
     ///
-    /// Unlike `put_scoped`, this never overwrites a concurrent owner. It is the
-    /// scoped counterpart to `put_if(..., MustCreate)` for records whose scope
-    /// is required by later provider-owned enumeration and cleanup.
+    /// Unlike [`Self::put_scoped`], this never updates an existing object. A
+    /// duplicate id or `(object_type, workspace, name)` returns
+    /// [`PersistenceError::UniqueViolation`]. Refresh grants use this as the
+    /// scoped counterpart to `put_if(..., MustCreate)`.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
