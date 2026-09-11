@@ -3063,10 +3063,11 @@ fn validate_subscription_oauth_material(
     Ok(())
 }
 
-fn refresh_configuration_matches(
+async fn refresh_configuration_matches(
+    credentials: &crate::credentials::CredentialRuntime,
     existing: &StoredProviderCredentialRefreshState,
     proposed: &StoredProviderCredentialRefreshState,
-) -> bool {
+) -> Result<bool, Status> {
     let existing_secret_keys = existing
         .secret_material_keys
         .iter()
@@ -3088,18 +3089,28 @@ fn refresh_configuration_matches(
         .map(String::as_str)
         .collect::<HashSet<_>>();
 
-    existing.provider_id == proposed.provider_id
+    let mut existing_material = existing.material.clone();
+    existing_material.extend(
+        credentials
+            .resolve_refresh_material(
+                crate::provider_refresh::refresh_material_scope(existing),
+                &existing.secret_material_handles,
+            )
+            .await?,
+    );
+
+    Ok(existing.provider_id == proposed.provider_id
         && existing.provider_name == proposed.provider_name
         && existing.credential_key == proposed.credential_key
         && existing.strategy == proposed.strategy
-        && existing.material == proposed.material
+        && existing_material == proposed.material
         && existing_secret_keys == proposed_secret_keys
         && existing.token_url == proposed.token_url
         && existing_scopes == proposed_scopes
         && existing.refresh_before_seconds == proposed.refresh_before_seconds
         && existing.max_lifetime_seconds == proposed.max_lifetime_seconds
         && existing.additional_output_keys == proposed.additional_output_keys
-        && existing.expires_at_ms == proposed.expires_at_ms
+        && existing.expires_at_ms == proposed.expires_at_ms)
 }
 
 fn validate_refresh_material(
@@ -4551,9 +4562,12 @@ pub(super) async fn handle_configure_provider_refresh(
     )?;
     if subscription_oauth::is_managed_strategy(strategy)
         && let Some(existing) = existing_refresh_state.as_ref()
-        && existing.status != "reauth_required"
+        && !matches!(
+            existing.status.as_str(),
+            "reauth_required" | "reauthorization_required"
+        )
     {
-        if refresh_configuration_matches(existing, &state_record) {
+        if refresh_configuration_matches(&state.credentials, existing, &state_record).await? {
             return Ok(Response::new(ConfigureProviderRefreshResponse {
                 status: Some(crate::provider_refresh::refresh_status_from_state(existing)),
             }));
@@ -4934,34 +4948,11 @@ pub(super) async fn handle_delete_provider_refresh(
     }
 
     let credential_cleared = if request.clear_credential {
-        let catalog = state
-            .provider_profile_sources
-            .snapshot_catalog(state.store.as_ref(), &workspace)
-            .await?;
-        let update = Provider {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: String::new(),
-                name: provider_name.to_string(),
-                created_at_ms: 0,
-                labels: HashMap::new(),
-                resource_version: 0,
-                annotations: HashMap::new(),
-                workspace: String::new(),
-                deletion_timestamp_ms: 0,
-            }),
-            r#type: String::new(),
-            credentials: HashMap::from([(credential_key.to_string(), String::new())]),
-            config: HashMap::new(),
-            credential_expires_at_ms: HashMap::from([(credential_key.to_string(), 0)]),
-            profile_workspace: String::new(),
-            credential_handles: HashMap::new(),
-        };
-        update_provider_record_validating(
+        clear_refresh_managed_provider_credential(
             state.store.as_ref(),
-            &workspace,
-            &catalog,
-            update,
-            Some(&state.credentials),
+            &state.credentials,
+            &provider,
+            credential_key,
         )
         .await?;
         true
@@ -5008,6 +4999,38 @@ pub(super) async fn handle_delete_provider_refresh(
         remote_revoked,
         credential_cleared,
     }))
+}
+
+async fn clear_refresh_managed_provider_credential(
+    store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
+    provider: &Provider,
+    credential_key: &str,
+) -> Result<(), Status> {
+    let mut removed_handle = None;
+    store
+        .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+            current.credentials.remove(credential_key);
+            current.credential_expires_at_ms.remove(credential_key);
+            removed_handle = current.credential_handles.remove(credential_key);
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "clear refresh-managed provider credential failed: {error}"
+            ))
+        })?;
+    if let Some(handle) = removed_handle {
+        credentials
+            .delete_provider_credential_handles(
+                provider.object_name(),
+                provider.object_workspace(),
+                provider.object_id(),
+                &HashMap::from([(credential_key.to_string(), handle)]),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 pub(super) async fn handle_delete_provider(
@@ -5882,8 +5905,12 @@ mod tests {
                 credential_key
             ));
             assert!(
-                active_provider_credential_keys(&provider, crate::persistence::current_time_ms())
-                    .is_empty()
+                active_provider_credential_keys(
+                    &provider,
+                    crate::persistence::current_time_ms(),
+                    &HashSet::new(),
+                )
+                .is_empty()
             );
         }
     }
@@ -7386,7 +7413,7 @@ mod tests {
         )
         .await
         .expect_err("failed remote revocation must preserve fenced local state");
-        assert_eq!(first_error.code(), Code::Unavailable);
+        assert_eq!(first_error.code(), Code::Unavailable, "{first_error:?}");
         assert!(!first_error.message().contains("response-secret-canary"));
         let failed_state = crate::provider_refresh::get_refresh_state(
             state.store.as_ref(),
@@ -7800,9 +7827,16 @@ mod tests {
             status.refresh_generation_id
         );
         assert_eq!(replacement.metadata.as_ref().unwrap().id, old_metadata_id);
+        let replacement_material = state
+            .credentials
+            .resolve_refresh_material(
+                crate::provider_refresh::refresh_material_scope(&replacement),
+                &replacement.secret_material_handles,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            replacement
-                .material
+            replacement_material
                 .get("refresh_token")
                 .map(String::as_str),
             Some("replacement-grant")
@@ -7868,8 +7902,9 @@ mod tests {
                 .is_some()
         );
 
-        crate::provider_refresh::delete_refresh_state(
+        crate::provider_refresh::delete_refresh_state_with_credentials(
             state.store.as_ref(),
+            &state.credentials,
             "default",
             provider.object_id(),
             crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,

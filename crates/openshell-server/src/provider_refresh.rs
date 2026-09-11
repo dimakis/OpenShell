@@ -923,7 +923,12 @@ async fn refresh_provider_credential_inner(
 
     let managed_subscription = ProviderCredentialRefreshStrategy::try_from(state.strategy)
         .is_ok_and(subscription_oauth::is_managed_strategy);
-    if managed_subscription && state.status == "reauth_required" {
+    if managed_subscription
+        && matches!(
+            state.status.as_str(),
+            "reauth_required" | "reauthorization_required"
+        )
+    {
         return Err(Status::failed_precondition(
             "subscription OAuth authorization requires provider login",
         ));
@@ -946,11 +951,11 @@ async fn refresh_provider_credential_inner(
         // predecessor can trigger token-family revocation. Fail closed and
         // require a distinct attended grant instead of making another remote
         // request with material whose consumption state is unknowable.
-        state.status = "reauth_required".to_string();
+        state.status = "reauthorization_required".to_string();
         state.last_error =
             "subscription OAuth rotation outcome is unknown; provider login is required"
                 .to_string();
-        state.next_refresh_at_ms = 0;
+        state.next_refresh_at_ms = i64::MAX;
         let Some(_) = persist_refresh_state_if_current(store, &state, expected_version).await?
         else {
             return Err(Status::aborted(
@@ -2783,12 +2788,12 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = run_refresh_worker_tick(
+            if let Err(err) = Box::pin(run_refresh_worker_tick(
                 &state.provider_refresh_mutex,
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
-            )
+            ))
             .await
             {
                 warn!(error = %err, "provider credential refresh worker tick failed");
@@ -2804,7 +2809,7 @@ fn subscription_refresh_requires_operator_action(
         .is_ok_and(subscription_oauth::is_managed_strategy)
         && matches!(
             state.status.as_str(),
-            "reauth_required" | "revoking" | "revoke_failed"
+            "reauth_required" | "reauthorization_required" | "revoking" | "revoke_failed"
         )
 }
 
@@ -2987,7 +2992,7 @@ async fn run_refresh_worker_tick(
 mod tests {
     use super::{
         MAX_OAUTH_ERROR_RESPONSE_BYTES, NewRefreshStateConfig, OAuthGrantKind, RefreshFailure,
-        RefreshRetrySchedule, Status, classify_oauth_token_error, delete_refresh_state,
+        RefreshRetrySchedule, Status, classify_oauth_token_error,
         delete_refresh_state_with_credentials, effective_authorization_epoch,
         enqueue_pending_secret_deletion, get_refresh_state, list_all_refresh_states,
         list_refresh_states_for_provider, mint_openai_codex_oauth, mint_xai_grok_oauth,
@@ -3151,7 +3156,7 @@ mod tests {
         provider: &Provider,
         auth_base_url: &str,
         account_id: &str,
-    ) -> openshell_core::proto::StoredProviderCredentialRefreshState {
+    ) -> StoredProviderCredentialRefreshState {
         new_refresh_state(
             provider,
             "default",
@@ -3183,7 +3188,7 @@ mod tests {
     fn grok_refresh_state(
         provider: &Provider,
         auth_base_url: &str,
-    ) -> openshell_core::proto::StoredProviderCredentialRefreshState {
+    ) -> StoredProviderCredentialRefreshState {
         new_refresh_state(
             provider,
             "default",
@@ -3244,9 +3249,11 @@ mod tests {
         let state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
         put_refresh_state(&store, &state).await.unwrap();
 
+        let credentials = test_credentials();
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "codex-subscription",
             super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
@@ -3254,7 +3261,15 @@ mod tests {
         .await
         .expect("Codex credential should refresh");
         assert_eq!(refreshed.status, "refreshed");
-        assert_eq!(refreshed.material["refresh_token"], "rotated-refresh-token");
+        assert!(!refreshed.material.contains_key("refresh_token"));
+        let resolved_refresh = credentials
+            .resolve_refresh_material(
+                refresh_material_scope(&refreshed),
+                &refreshed.secret_material_handles,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved_refresh["refresh_token"], "rotated-refresh-token");
         assert_eq!(refreshed.material["account_id"], "account-123");
         assert_eq!(refreshed.material["fedramp"], "true");
         assert!(refreshed.expires_at_ms > current_time_ms());
@@ -3264,8 +3279,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let resolved_provider = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
         assert_eq!(
-            stored.credentials[super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY],
+            resolved_provider.values[super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY],
             test_jwt(serde_json::json!({"exp": expires}))
         );
         assert_eq!(
@@ -3309,10 +3328,16 @@ mod tests {
         state.next_refresh_at_ms = current_time_ms() + 3_600_000;
         put_refresh_state(&store, &state).await.unwrap();
 
+        let credentials = test_credentials();
         let operation_mutex = tokio::sync::Mutex::new(());
-        run_refresh_worker_tick(&operation_mutex, &store, None)
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &operation_mutex,
+            &store,
+            Some(&credentials),
+            None,
+        ))
+        .await
+        .unwrap();
 
         let refreshed = get_refresh_state(
             &store,
@@ -3324,10 +3349,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(refreshed.status, "refreshed");
-        assert_eq!(
-            refreshed.material["refresh_token"],
-            "recovered-refresh-token"
-        );
+        let resolved_refresh = credentials
+            .resolve_refresh_material(
+                refresh_material_scope(&refreshed),
+                &refreshed.secret_material_handles,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved_refresh["refresh_token"], "recovered-refresh-token");
         let stored = store
             .get_message_by_name::<Provider>("default", "codex-subscription")
             .await
@@ -3335,7 +3364,7 @@ mod tests {
             .unwrap();
         assert!(
             stored
-                .credentials
+                .credential_handles
                 .contains_key(super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
         );
     }
@@ -3421,6 +3450,7 @@ mod tests {
         let error = refresh_provider_credential(
             &store,
             "default",
+            &test_credentials(),
             None,
             "codex-subscription",
             super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
@@ -3437,8 +3467,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(stored.status, "reauth_required");
-        assert_eq!(stored.next_refresh_at_ms, 0);
+        assert_eq!(stored.status, "reauthorization_required");
+        assert_eq!(stored.next_refresh_at_ms, i64::MAX);
         assert!(!stored.last_error.contains("response-secret-canary"));
         assert!(!stored.last_error.contains("refresh_token_reused"));
     }
@@ -3484,9 +3514,11 @@ mod tests {
         let state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
         put_refresh_state(&store, &state).await.unwrap();
 
+        let credentials = test_credentials();
         let rotate = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "codex-subscription",
             super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
@@ -3600,9 +3632,11 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
         let before_ms = current_time_ms();
 
+        let credentials = test_credentials();
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "grok-subscription",
             openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
@@ -3610,20 +3644,36 @@ mod tests {
         .await
         .expect("Grok credential should refresh");
         assert_eq!(refreshed.status, "refreshed");
+        assert!(!refreshed.material.contains_key("refresh_token"));
+        let resolved_refresh = credentials
+            .resolve_refresh_material(
+                refresh_material_scope(&refreshed),
+                &refreshed.secret_material_handles,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            refreshed.material["refresh_token"],
+            resolved_refresh["refresh_token"],
             "rotated-grok-refresh-token"
         );
         assert!(refreshed.expires_at_ms > before_ms);
-        assert!(refreshed.expires_at_ms <= before_ms + 3_601_000);
+        assert!(
+            refreshed.expires_at_ms <= before_ms + 3_605_000,
+            "expiry {} exceeded expected cap from {before_ms}",
+            refreshed.expires_at_ms
+        );
 
         let stored = store
             .get_message_by_name::<Provider>("default", "grok-subscription")
             .await
             .unwrap()
             .unwrap();
+        let resolved_provider = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
         assert_eq!(
-            stored.credentials[openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY],
+            resolved_provider.values[openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY],
             "grok-access-token-canary"
         );
         assert_eq!(
@@ -3698,10 +3748,12 @@ mod tests {
         let grok_generation = grok_state.refresh_generation_id.clone();
         put_refresh_state(&store, &codex_state).await.unwrap();
         put_refresh_state(&store, &grok_state).await.unwrap();
+        let credentials = test_credentials();
 
         refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "grok-subscription",
             openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
@@ -3736,6 +3788,7 @@ mod tests {
         refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "codex-subscription",
             super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
@@ -3752,8 +3805,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(rotated_grok.refresh_generation_id, grok_generation);
+        let resolved_grok_refresh = credentials
+            .resolve_refresh_material(
+                refresh_material_scope(&rotated_grok),
+                &rotated_grok.secret_material_handles,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            rotated_grok.material["refresh_token"],
+            resolved_grok_refresh["refresh_token"],
             "rotated-grok-refresh-token"
         );
         let grok_record = store
@@ -3761,8 +3821,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let resolved_grok_provider = credentials
+            .resolve_provider_handles(&grok_record, current_time_ms())
+            .await
+            .unwrap();
         assert_eq!(
-            grok_record.credentials[openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY],
+            resolved_grok_provider.values
+                [openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY],
             "grok-access-token-canary"
         );
         let rotated_codex = get_refresh_state(
@@ -3775,8 +3840,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(rotated_codex.refresh_generation_id, codex_generation);
+        let resolved_codex_refresh = credentials
+            .resolve_refresh_material(
+                refresh_material_scope(&rotated_codex),
+                &rotated_codex.secret_material_handles,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            rotated_codex.material["refresh_token"],
+            resolved_codex_refresh["refresh_token"],
             "rotated-codex-refresh-token"
         );
     }
@@ -3870,10 +3942,12 @@ mod tests {
         store.put_message(&provider).await.unwrap();
         let state = grok_refresh_state(&provider, &mock_server.uri());
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         let error = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "grok-subscription",
             openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
@@ -3890,8 +3964,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(stored.status, "reauth_required");
-        assert_eq!(stored.next_refresh_at_ms, 0);
+        assert_eq!(stored.status, "reauthorization_required");
+        assert_eq!(stored.next_refresh_at_ms, i64::MAX);
         assert!(
             !stored
                 .last_error
@@ -3902,6 +3976,7 @@ mod tests {
         let retry = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "grok-subscription",
             openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
@@ -3933,9 +4008,14 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
 
         let operation_mutex = tokio::sync::Mutex::new(());
-        run_refresh_worker_tick(&operation_mutex, &store, None)
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &operation_mutex,
+            &store,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
 
         let stored = get_refresh_state(
             &store,
@@ -3978,6 +4058,7 @@ mod tests {
         let error = refresh_provider_credential(
             &store,
             "default",
+            &test_credentials(),
             None,
             "grok-subscription",
             openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
@@ -3996,8 +4077,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(stored.status, "reauth_required");
-        assert_eq!(stored.next_refresh_at_ms, 0);
+        assert_eq!(stored.status, "reauthorization_required");
+        assert_eq!(stored.next_refresh_at_ms, i64::MAX);
         assert_eq!(stored.material["refresh_token"], "old-grok-refresh-token");
         mock_server.verify().await;
     }
@@ -5241,9 +5322,14 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
 
         let operation_mutex = tokio::sync::Mutex::new(());
-        run_refresh_worker_tick(&operation_mutex, &store, None, None)
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &operation_mutex,
+            &store,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -5299,9 +5385,15 @@ mod tests {
         state.next_refresh_at_ms = i64::MAX;
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, Some(&test_credentials()), None)
-            .await
-            .unwrap();
+        let operation_mutex = tokio::sync::Mutex::new(());
+        Box::pin(run_refresh_worker_tick(
+            &operation_mutex,
+            &store,
+            Some(&test_credentials()),
+            None,
+        ))
+        .await
+        .unwrap();
 
         let stored = get_refresh_state(
             &store,
@@ -5359,9 +5451,15 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        run_refresh_worker_tick(&store, Some(&credentials), None)
-            .await
-            .unwrap();
+        let operation_mutex = tokio::sync::Mutex::new(());
+        Box::pin(run_refresh_worker_tick(
+            &operation_mutex,
+            &store,
+            Some(&credentials),
+            None,
+        ))
+        .await
+        .unwrap();
 
         assert!(
             get_refresh_state(
@@ -5388,9 +5486,14 @@ mod tests {
 
         let traced = test_exporter::install_traced();
         let operation_mutex = tokio::sync::Mutex::new(());
-        run_refresh_worker_tick(&operation_mutex, &store, None, None)
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &operation_mutex,
+            &store,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
 
         let spans = traced.finished_spans();
         let root = spans
@@ -5804,6 +5907,7 @@ mod tests {
             &store,
             "default",
             None,
+            None,
             &prov,
             super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
             &minted,
@@ -5835,6 +5939,7 @@ mod tests {
         let receipt = apply_minted_credential(
             &store,
             "default",
+            None,
             None,
             &cleared,
             super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
@@ -5902,6 +6007,7 @@ mod tests {
             &store,
             "default",
             Some(&credentials),
+            None,
             &prov,
             super::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
             &minted,

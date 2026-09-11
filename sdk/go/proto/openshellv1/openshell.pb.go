@@ -160,6 +160,12 @@ const (
 	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS  ProviderCredentialRefreshStrategy = 4
 	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT ProviderCredentialRefreshStrategy = 5
 	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE        ProviderCredentialRefreshStrategy = 6
+	// OpenAI's public Codex/ChatGPT subscription OAuth refresh contract. The
+	// gateway pins the issuer/client and never accepts a caller-supplied token URL.
+	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH ProviderCredentialRefreshStrategy = 7
+	// xAI's experimental Grok subscription OAuth refresh contract. The gateway
+	// pins the issuer/client/scopes and never accepts caller-supplied authority.
+	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH ProviderCredentialRefreshStrategy = 8
 )
 
 // Enum value maps for ProviderCredentialRefreshStrategy.
@@ -172,6 +178,8 @@ var (
 		4: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS",
 		5: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT",
 		6: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE",
+		7: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH",
+		8: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH",
 	}
 	ProviderCredentialRefreshStrategy_value = map[string]int32{
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED":                0,
@@ -181,6 +189,8 @@ var (
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS":  4,
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT": 5,
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE":        6,
+		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH":         7,
+		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH":             8,
 	}
 )
 
@@ -1228,9 +1238,15 @@ type SandboxSpec struct {
 	// portable scratch login shell before persistence.
 	Command []string `protobuf:"bytes,12,rep,name=command,proto3" json:"command,omitempty"`
 	// Allocate a retained pseudo-terminal for the main process.
-	Tty           bool `protobuf:"varint,13,opt,name=tty,proto3" json:"tty,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Tty bool `protobuf:"varint,13,opt,name=tty,proto3" json:"tty,omitempty"`
+	// Optional sandbox-local inference provider selection. When set, this exact
+	// provider must also appear in `providers`; it overrides the workspace route
+	// for this sandbox without consulting attachment order.
+	InferenceProvider string `protobuf:"bytes,14,opt,name=inference_provider,json=inferenceProvider,proto3" json:"inference_provider,omitempty"`
+	// Model paired with `inference_provider`. Both fields must be set together.
+	InferenceModel string `protobuf:"bytes,15,opt,name=inference_model,json=inferenceModel,proto3" json:"inference_model,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *SandboxSpec) Reset() {
@@ -1317,6 +1333,20 @@ func (x *SandboxSpec) GetTty() bool {
 		return x.Tty
 	}
 	return false
+}
+
+func (x *SandboxSpec) GetInferenceProvider() string {
+	if x != nil {
+		return x.InferenceProvider
+	}
+	return ""
+}
+
+func (x *SandboxSpec) GetInferenceModel() string {
+	if x != nil {
+		return x.InferenceModel
+	}
+	return ""
 }
 
 type ResourceRequirements struct {
@@ -5935,17 +5965,16 @@ type ProviderCredentialRefreshStatus struct {
 	LastRefreshAtMs int64                                   `protobuf:"varint,8,opt,name=last_refresh_at_ms,json=lastRefreshAtMs,proto3" json:"last_refresh_at_ms,omitempty"`
 	LastError       string                                  `protobuf:"bytes,9,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"`
 	RecoveryAction  ProviderCredentialRefreshRecoveryAction `protobuf:"varint,10,opt,name=recovery_action,json=recoveryAction,proto3,enum=openshell.v1.ProviderCredentialRefreshRecoveryAction" json:"recovery_action,omitempty"`
-	// Stable gateway-owned failure identifier, for example
-	// "oauth_invalid_grant". This is not provider-controlled prose and
-	// incorporates any recognized top-level OAuth error classification.
-	FailureCode string `protobuf:"bytes,11,opt,name=failure_code,json=failureCode,proto3" json:"failure_code,omitempty"`
-	// A bounded, recognized provider subtype that refines failure_code; clients
-	// do not need a separate provider_error field. Unknown provider-controlled
-	// values are not persisted or returned.
+	// Stable gateway-owned failure identifier.
+	FailureCode          string `protobuf:"bytes,11,opt,name=failure_code,json=failureCode,proto3" json:"failure_code,omitempty"`
 	ProviderErrorSubtype string `protobuf:"bytes,12,opt,name=provider_error_subtype,json=providerErrorSubtype,proto3" json:"provider_error_subtype,omitempty"`
 	LastErrorAtMs        int64  `protobuf:"varint,13,opt,name=last_error_at_ms,json=lastErrorAtMs,proto3" json:"last_error_at_ms,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Opaque identity of this configured grant generation. Clients may use it to
+	// fence cleanup after a multi-step grant operation without receiving secret
+	// material. It changes whenever configure replaces a refresh grant.
+	RefreshGenerationId string `protobuf:"bytes,14,opt,name=refresh_generation_id,json=refreshGenerationId,proto3" json:"refresh_generation_id,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ProviderCredentialRefreshStatus) Reset() {
@@ -6069,6 +6098,13 @@ func (x *ProviderCredentialRefreshStatus) GetLastErrorAtMs() int64 {
 	return 0
 }
 
+func (x *ProviderCredentialRefreshStatus) GetRefreshGenerationId() string {
+	if x != nil {
+		return x.RefreshGenerationId
+	}
+	return ""
+}
+
 // Provider profile local discovery declaration.
 type ProviderProfileDiscovery struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -6142,27 +6178,29 @@ type StoredProviderCredentialRefreshState struct {
 	// collision reservation, and env-key surfacing so later profile edits cannot
 	// silently redirect writes.
 	AdditionalOutputKeys map[string]string `protobuf:"bytes,17,rep,name=additional_output_keys,json=additionalOutputKeys,proto3" json:"additional_output_keys,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Opaque generation fence used by attended login/logout workflows.
+	RefreshGenerationId string `protobuf:"bytes,18,opt,name=refresh_generation_id,json=refreshGenerationId,proto3" json:"refresh_generation_id,omitempty"`
 	// Opaque gateway-owned authorization epoch for the configured refresh
 	// grant. Explicit refresh configuration creates a new epoch; automatic and
 	// manual token rotation preserve it. It is never derived from or exposed
 	// with refresh material.
-	AuthorizationEpoch string `protobuf:"bytes,18,opt,name=authorization_epoch,json=authorizationEpoch,proto3" json:"authorization_epoch,omitempty"`
+	AuthorizationEpoch string `protobuf:"bytes,19,opt,name=authorization_epoch,json=authorizationEpoch,proto3" json:"authorization_epoch,omitempty"`
 	// Secret refresh material is stored through the gateway's active credential
 	// driver. The persisted refresh state keeps only opaque handles; resolved
 	// values exist in gateway memory for the duration of one mint operation.
-	SecretMaterialHandles map[string]*datamodelv1.CredentialHandle `protobuf:"bytes,19,rep,name=secret_material_handles,json=secretMaterialHandles,proto3" json:"secret_material_handles,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	SecretMaterialHandles map[string]*datamodelv1.CredentialHandle `protobuf:"bytes,20,rep,name=secret_material_handles,json=secretMaterialHandles,proto3" json:"secret_material_handles,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Handles replaced by reconfiguration or issuer-driven refresh-token
 	// rotation. This is a repeated entry rather than a material-keyed map so
 	// multiple superseded generations of the same material remain recoverable.
 	// Cleanup is retried by the refresh worker so a gateway crash or temporary
 	// credential-backend outage does not lose the deletion reference.
-	PendingSecretDeletions []*StoredRefreshMaterialDeletion `protobuf:"bytes,20,rep,name=pending_secret_deletions,json=pendingSecretDeletions,proto3" json:"pending_secret_deletions,omitempty"`
+	PendingSecretDeletions []*StoredRefreshMaterialDeletion `protobuf:"bytes,21,rep,name=pending_secret_deletions,json=pendingSecretDeletions,proto3" json:"pending_secret_deletions,omitempty"`
 	// Structured recovery details for the most recent refresh failure. These
 	// fields contain only gateway-owned codes and recognized bounded values.
-	RecoveryAction       ProviderCredentialRefreshRecoveryAction `protobuf:"varint,21,opt,name=recovery_action,json=recoveryAction,proto3,enum=openshell.v1.ProviderCredentialRefreshRecoveryAction" json:"recovery_action,omitempty"`
-	FailureCode          string                                  `protobuf:"bytes,22,opt,name=failure_code,json=failureCode,proto3" json:"failure_code,omitempty"`
-	ProviderErrorSubtype string                                  `protobuf:"bytes,23,opt,name=provider_error_subtype,json=providerErrorSubtype,proto3" json:"provider_error_subtype,omitempty"`
-	LastErrorAtMs        int64                                   `protobuf:"varint,24,opt,name=last_error_at_ms,json=lastErrorAtMs,proto3" json:"last_error_at_ms,omitempty"`
+	RecoveryAction       ProviderCredentialRefreshRecoveryAction `protobuf:"varint,22,opt,name=recovery_action,json=recoveryAction,proto3,enum=openshell.v1.ProviderCredentialRefreshRecoveryAction" json:"recovery_action,omitempty"`
+	FailureCode          string                                  `protobuf:"bytes,23,opt,name=failure_code,json=failureCode,proto3" json:"failure_code,omitempty"`
+	ProviderErrorSubtype string                                  `protobuf:"bytes,24,opt,name=provider_error_subtype,json=providerErrorSubtype,proto3" json:"provider_error_subtype,omitempty"`
+	LastErrorAtMs        int64                                   `protobuf:"varint,25,opt,name=last_error_at_ms,json=lastErrorAtMs,proto3" json:"last_error_at_ms,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -6314,6 +6352,13 @@ func (x *StoredProviderCredentialRefreshState) GetAdditionalOutputKeys() map[str
 		return x.AdditionalOutputKeys
 	}
 	return nil
+}
+
+func (x *StoredProviderCredentialRefreshState) GetRefreshGenerationId() string {
+	if x != nil {
+		return x.RefreshGenerationId
+	}
+	return ""
 }
 
 func (x *StoredProviderCredentialRefreshState) GetAuthorizationEpoch() string {
@@ -6774,9 +6819,18 @@ type DeleteProviderRefreshRequest struct {
 	Provider      string                 `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
 	CredentialKey string                 `protobuf:"bytes,2,opt,name=credential_key,json=credentialKey,proto3" json:"credential_key,omitempty"`
 	// Workspace scope. Empty defaults to "default".
-	Workspace     string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Workspace string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	// Revoke a supported OAuth grant at its pinned authority before deleting the
+	// local refresh state. Supported only by reviewed subscription OAuth
+	// strategies with pinned remote revocation authorities.
+	RevokeRemote bool `protobuf:"varint,4,opt,name=revoke_remote,json=revokeRemote,proto3" json:"revoke_remote,omitempty"`
+	// Remove the primary minted credential after successful revocation.
+	ClearCredential bool `protobuf:"varint,5,opt,name=clear_credential,json=clearCredential,proto3" json:"clear_credential,omitempty"`
+	// Optional optimistic fence. When set, deletion/revocation proceeds only if
+	// the current refresh state has this exact configured-grant generation.
+	ExpectedRefreshGenerationId string `protobuf:"bytes,6,opt,name=expected_refresh_generation_id,json=expectedRefreshGenerationId,proto3" json:"expected_refresh_generation_id,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *DeleteProviderRefreshRequest) Reset() {
@@ -6830,11 +6884,34 @@ func (x *DeleteProviderRefreshRequest) GetWorkspace() string {
 	return ""
 }
 
+func (x *DeleteProviderRefreshRequest) GetRevokeRemote() bool {
+	if x != nil {
+		return x.RevokeRemote
+	}
+	return false
+}
+
+func (x *DeleteProviderRefreshRequest) GetClearCredential() bool {
+	if x != nil {
+		return x.ClearCredential
+	}
+	return false
+}
+
+func (x *DeleteProviderRefreshRequest) GetExpectedRefreshGenerationId() string {
+	if x != nil {
+		return x.ExpectedRefreshGenerationId
+	}
+	return ""
+}
+
 type DeleteProviderRefreshResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Deleted       bool                   `protobuf:"varint,1,opt,name=deleted,proto3" json:"deleted,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Deleted           bool                   `protobuf:"varint,1,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	RemoteRevoked     bool                   `protobuf:"varint,2,opt,name=remote_revoked,json=remoteRevoked,proto3" json:"remote_revoked,omitempty"`
+	CredentialCleared bool                   `protobuf:"varint,3,opt,name=credential_cleared,json=credentialCleared,proto3" json:"credential_cleared,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *DeleteProviderRefreshResponse) Reset() {
@@ -6870,6 +6947,20 @@ func (*DeleteProviderRefreshResponse) Descriptor() ([]byte, []int) {
 func (x *DeleteProviderRefreshResponse) GetDeleted() bool {
 	if x != nil {
 		return x.Deleted
+	}
+	return false
+}
+
+func (x *DeleteProviderRefreshResponse) GetRemoteRevoked() bool {
+	if x != nil {
+		return x.RemoteRevoked
+	}
+	return false
+}
+
+func (x *DeleteProviderRefreshResponse) GetCredentialCleared() bool {
+	if x != nil {
+		return x.CredentialCleared
 	}
 	return false
 }
@@ -13995,7 +14086,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\aSandbox\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12-\n" +
 	"\x04spec\x18\x02 \x01(\v2\x19.openshell.v1.SandboxSpecR\x04spec\x123\n" +
-	"\x06status\x18\x03 \x01(\v2\x1b.openshell.v1.SandboxStatusR\x06statusJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\x05phaseR\x16current_policy_version\"\x83\x04\n" +
+	"\x06status\x18\x03 \x01(\v2\x1b.openshell.v1.SandboxStatusR\x06statusJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\x05phaseR\x16current_policy_version\"\xdb\x04\n" +
 	"\vSandboxSpec\x12\x1b\n" +
 	"\tlog_level\x18\x01 \x01(\tR\blogLevel\x12L\n" +
 	"\venvironment\x18\x05 \x03(\v2*.openshell.v1.SandboxSpec.EnvironmentEntryR\venvironment\x129\n" +
@@ -14004,7 +14095,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\tproviders\x18\b \x03(\tR\tproviders\x12W\n" +
 	"\x15resource_requirements\x18\t \x01(\v2\".openshell.v1.ResourceRequirementsR\x14resourceRequirements\x12\x18\n" +
 	"\acommand\x18\f \x03(\tR\acommand\x12\x10\n" +
-	"\x03tty\x18\r \x01(\bR\x03tty\x1a>\n" +
+	"\x03tty\x18\r \x01(\bR\x03tty\x12-\n" +
+	"\x12inference_provider\x18\x0e \x01(\tR\x11inferenceProvider\x12'\n" +
+	"\x0finference_model\x18\x0f \x01(\tR\x0einferenceModel\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\n" +
@@ -14369,7 +14462,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x16refresh_before_seconds\x18\x04 \x01(\x03R\x14refreshBeforeSeconds\x120\n" +
 	"\x14max_lifetime_seconds\x18\x05 \x01(\x03R\x12maxLifetimeSeconds\x12K\n" +
 	"\bmaterial\x18\x06 \x03(\v2/.openshell.v1.ProviderCredentialRefreshMaterialR\bmaterial\x12\\\n" +
-	"\x12additional_outputs\x18\a \x03(\v2-.openshell.v1.ProviderCredentialRefreshOutputR\x11additionalOutputs\"\xf2\x04\n" +
+	"\x12additional_outputs\x18\a \x03(\v2-.openshell.v1.ProviderCredentialRefreshOutputR\x11additionalOutputs\"\xa6\x05\n" +
 	"\x1fProviderCredentialRefreshStatus\x12#\n" +
 	"\rprovider_name\x18\x01 \x01(\tR\fproviderName\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
@@ -14386,9 +14479,10 @@ const file_openshell_proto_rawDesc = "" +
 	" \x01(\x0e25.openshell.v1.ProviderCredentialRefreshRecoveryActionR\x0erecoveryAction\x12!\n" +
 	"\ffailure_code\x18\v \x01(\tR\vfailureCode\x124\n" +
 	"\x16provider_error_subtype\x18\f \x01(\tR\x14providerErrorSubtype\x12'\n" +
-	"\x10last_error_at_ms\x18\r \x01(\x03R\rlastErrorAtMs\"<\n" +
+	"\x10last_error_at_ms\x18\r \x01(\x03R\rlastErrorAtMs\x122\n" +
+	"\x15refresh_generation_id\x18\x0e \x01(\tR\x13refreshGenerationId\"<\n" +
 	"\x18ProviderProfileDiscovery\x12 \n" +
-	"\vcredentials\x18\x01 \x03(\tR\vcredentials\"\x89\r\n" +
+	"\vcredentials\x18\x01 \x03(\tR\vcredentials\"\xbd\r\n" +
 	"$StoredProviderCredentialRefreshState\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
@@ -14409,14 +14503,15 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06scopes\x18\x0e \x03(\tR\x06scopes\x124\n" +
 	"\x16refresh_before_seconds\x18\x0f \x01(\x03R\x14refreshBeforeSeconds\x120\n" +
 	"\x14max_lifetime_seconds\x18\x10 \x01(\x03R\x12maxLifetimeSeconds\x12\x82\x01\n" +
-	"\x16additional_output_keys\x18\x11 \x03(\v2L.openshell.v1.StoredProviderCredentialRefreshState.AdditionalOutputKeysEntryR\x14additionalOutputKeys\x12/\n" +
-	"\x13authorization_epoch\x18\x12 \x01(\tR\x12authorizationEpoch\x12\x85\x01\n" +
-	"\x17secret_material_handles\x18\x13 \x03(\v2M.openshell.v1.StoredProviderCredentialRefreshState.SecretMaterialHandlesEntryR\x15secretMaterialHandles\x12e\n" +
-	"\x18pending_secret_deletions\x18\x14 \x03(\v2+.openshell.v1.StoredRefreshMaterialDeletionR\x16pendingSecretDeletions\x12^\n" +
-	"\x0frecovery_action\x18\x15 \x01(\x0e25.openshell.v1.ProviderCredentialRefreshRecoveryActionR\x0erecoveryAction\x12!\n" +
-	"\ffailure_code\x18\x16 \x01(\tR\vfailureCode\x124\n" +
-	"\x16provider_error_subtype\x18\x17 \x01(\tR\x14providerErrorSubtype\x12'\n" +
-	"\x10last_error_at_ms\x18\x18 \x01(\x03R\rlastErrorAtMs\x1a;\n" +
+	"\x16additional_output_keys\x18\x11 \x03(\v2L.openshell.v1.StoredProviderCredentialRefreshState.AdditionalOutputKeysEntryR\x14additionalOutputKeys\x122\n" +
+	"\x15refresh_generation_id\x18\x12 \x01(\tR\x13refreshGenerationId\x12/\n" +
+	"\x13authorization_epoch\x18\x13 \x01(\tR\x12authorizationEpoch\x12\x85\x01\n" +
+	"\x17secret_material_handles\x18\x14 \x03(\v2M.openshell.v1.StoredProviderCredentialRefreshState.SecretMaterialHandlesEntryR\x15secretMaterialHandles\x12e\n" +
+	"\x18pending_secret_deletions\x18\x15 \x03(\v2+.openshell.v1.StoredRefreshMaterialDeletionR\x16pendingSecretDeletions\x12^\n" +
+	"\x0frecovery_action\x18\x16 \x01(\x0e25.openshell.v1.ProviderCredentialRefreshRecoveryActionR\x0erecoveryAction\x12!\n" +
+	"\ffailure_code\x18\x17 \x01(\tR\vfailureCode\x124\n" +
+	"\x16provider_error_subtype\x18\x18 \x01(\tR\x14providerErrorSubtype\x12'\n" +
+	"\x10last_error_at_ms\x18\x19 \x01(\x03R\rlastErrorAtMs\x1a;\n" +
 	"\rMaterialEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aG\n" +
@@ -14454,13 +14549,18 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12\x1c\n" +
 	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"i\n" +
 	" RotateProviderCredentialResponse\x12E\n" +
-	"\x06status\x18\x01 \x01(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\x06status\"\x7f\n" +
+	"\x06status\x18\x01 \x01(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\x06status\"\x94\x02\n" +
 	"\x1cDeleteProviderRefreshRequest\x12\x1a\n" +
 	"\bprovider\x18\x01 \x01(\tR\bprovider\x12%\n" +
 	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12\x1c\n" +
-	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"9\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12#\n" +
+	"\rrevoke_remote\x18\x04 \x01(\bR\frevokeRemote\x12)\n" +
+	"\x10clear_credential\x18\x05 \x01(\bR\x0fclearCredential\x12C\n" +
+	"\x1eexpected_refresh_generation_id\x18\x06 \x01(\tR\x1bexpectedRefreshGenerationId\"\x8f\x01\n" +
 	"\x1dDeleteProviderRefreshResponse\x12\x18\n" +
-	"\adeleted\x18\x01 \x01(\bR\adeleted\"\xd8\x05\n" +
+	"\adeleted\x18\x01 \x01(\bR\adeleted\x12%\n" +
+	"\x0eremote_revoked\x18\x02 \x01(\bR\rremoteRevoked\x12-\n" +
+	"\x12credential_cleared\x18\x03 \x01(\bR\x11credentialCleared\"\xd8\x05\n" +
 	"\x0fProviderProfile\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12!\n" +
 	"\fdisplay_name\x18\x02 \x01(\tR\vdisplayName\x12 \n" +
@@ -15043,7 +15143,7 @@ const file_openshell_proto_rawDesc = "" +
 	" ProviderCredentialTokenGrantType\x124\n" +
 	"0PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED\x10\x00\x12;\n" +
 	"7PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS\x10\x01\x127\n" +
-	"3PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE\x10\x02*\xc3\x03\n" +
+	"3PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE\x10\x02*\xb9\x04\n" +
 	"!ProviderCredentialRefreshStrategy\x124\n" +
 	"0PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED\x10\x00\x12/\n" +
 	"+PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC\x10\x01\x121\n" +
@@ -15051,7 +15151,9 @@ const file_openshell_proto_rawDesc = "" +
 	"9PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN\x10\x03\x12B\n" +
 	">PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS\x10\x04\x12C\n" +
 	"?PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT\x10\x05\x12<\n" +
-	"8PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE\x10\x06*\xdb\x02\n" +
+	"8PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE\x10\x06\x12;\n" +
+	"7PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH\x10\a\x127\n" +
+	"3PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH\x10\b*\xdb\x02\n" +
 	"\x17ProviderProfileCategory\x12)\n" +
 	"%PROVIDER_PROFILE_CATEGORY_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fPROVIDER_PROFILE_CATEGORY_OTHER\x10\x01\x12'\n" +

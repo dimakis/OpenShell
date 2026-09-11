@@ -92,6 +92,7 @@ pub trait CredentialDriver: std::fmt::Debug + Send + Sync {
     fn fail_next_delete(&self) {}
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn gate_next_store(
         &self,
     ) -> Option<(
@@ -255,6 +256,7 @@ impl CredentialRuntime {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn gate_next_store(
         &self,
     ) -> (

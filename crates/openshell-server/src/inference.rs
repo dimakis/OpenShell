@@ -1820,6 +1820,7 @@ mod tests {
             "publishing",
             "error",
             "reauth_required",
+            "reauthorization_required",
             "revoking",
             "revoke_failed",
         ] {

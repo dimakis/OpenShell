@@ -3472,10 +3472,12 @@ pub async fn provider_subscription_login(
             .into_diagnostic()?
             .into_inner()
             .credentials;
-        if statuses
-            .iter()
-            .any(|status| status.status != "reauth_required")
-        {
+        if statuses.iter().any(|status| {
+            !matches!(
+                status.status.as_str(),
+                "reauth_required" | "reauthorization_required"
+            )
+        }) {
             return Err(miette!(
                 "provider '{provider_name}' already has a subscription grant; log out before replacing an active or indeterminate grant"
             ));

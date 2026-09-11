@@ -2866,6 +2866,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: Some("/chat/completions".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         // The client sends the bare model name; the body rewrite must replace it

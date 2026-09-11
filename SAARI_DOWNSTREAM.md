@@ -21,6 +21,27 @@ Do not install this downstream from a moving `main`, `latest`, or feature
 branch. The paired NemoClaw release checks for the required OpenShell inference
 flags and registered provider before it mutates a sandbox.
 
+## Mitzo Production Release
+
+Mitzo uses a separate downstream line based on upstream OpenShell `v0.0.116`:
+
+- immutable release: `saariuslystoned/OpenShell` at `v0.0.116-mitzo.1`
+- maintenance branch: `codex/mitzo-oauth-v0.0.116`
+- required provider name: `mitzo-personal-subscription`
+- required provider type: `openai-codex-oauth`
+
+The Mitzo release carries the subscription OAuth broker and `inference.local`
+routing that complement Mitzo's own broker-binding enforcement. Deploying the
+Mitzo application alone is insufficient: the gateway must run this downstream
+release (or a later explicitly validated port) for attended subscription login
+and credential-free sandbox inference to work.
+
+Never replace this gateway with a stock OpenShell upgrade. Start each upgrade
+from the new immutable upstream tag, port the downstream commits, and prove the
+provider login, stored refresh handles, refresh/reauthorization state machine,
+`inference.local` routing, and credential-free inference in an isolated gateway
+before changing production.
+
 ## Maintained Provider Scope
 
 This release adds gateway-owned OAuth and routing for:
@@ -60,6 +81,11 @@ For each new upstream release:
    release notes.
 6. Install only the paired tags, then verify one live sandbox at a time with
    rollback snapshots available.
+
+For Mitzo releases, apply the same sequence to the `-mitzo.N` tag and update the
+Mitzo repository's `docs/operations/openshell-subscription-upgrades.md` record
+with the upstream base, downstream tag, exact commit, validation evidence, and
+rollback path.
 
 Upstream remains the source for general OpenShell behavior. This downstream
 owns the subscription-provider compatibility port and the proof needed to keep
