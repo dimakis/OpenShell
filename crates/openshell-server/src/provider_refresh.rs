@@ -2079,6 +2079,8 @@ pub async fn revoke_subscription_oauth_with_credentials(
 async fn mint_google_service_account_jwt(
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
+    crate::install_jsonwebtoken_crypto_provider();
+
     let token_url = google_token_url(state);
     let client_email = required_material(&state.material, "client_email")?;
     let private_key = required_material(&state.material, "private_key")?;

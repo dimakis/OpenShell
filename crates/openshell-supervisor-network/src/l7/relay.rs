@@ -42,6 +42,8 @@ pub struct L7EvalContext {
     pub host: String,
     /// Port from the CONNECT request.
     pub port: u16,
+    /// Workspace the sandbox belongs to, learned from `GetSandboxConfigResponse`.
+    pub workspace: String,
     /// Default authority port for the inspected HTTP transport (80 for
     /// plaintext, 443 after TLS termination).
     pub(crate) request_default_port: Option<u16>,
@@ -1012,21 +1014,39 @@ pub(crate) async fn websocket_middleware_preflight(
         .map_or(req.raw_header.len(), |position| position + 4);
     let requested_subprotocols =
         crate::l7::rest::websocket_requested_subprotocols(&req.raw_header[..header_end])?;
-    runner
-        .preflight_websocket(
-            chain,
-            openshell_supervisor_middleware::WebSocketPreflightInput {
-                session_id: uuid::Uuid::new_v4().to_string(),
-                request_id: uuid::Uuid::new_v4().to_string(),
-                sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
-                scheme: scheme.to_string(),
-                host: ctx.host.clone(),
-                port: ctx.port,
-                path: req.target.clone(),
-                requested_subprotocols,
-            },
-        )
-        .await
+    let input = websocket_preflight_input(
+        openshell_ocsf::ctx::ctx(),
+        ctx,
+        req,
+        scheme,
+        requested_subprotocols,
+    );
+    runner.preflight_websocket(chain, input).await
+}
+
+/// Build the WebSocket preflight input from the sandbox and evaluation
+/// contexts. Kept separate from `websocket_middleware_preflight` (and taking an
+/// explicit `SandboxContext`) so the identifier copy is unit-testable with a
+/// real sandbox name, mirroring `middleware_request_input` on the HTTP path.
+fn websocket_preflight_input(
+    sandbox: &openshell_ocsf::SandboxContext,
+    ctx: &L7EvalContext,
+    req: &crate::l7::provider::L7Request,
+    scheme: &str,
+    requested_subprotocols: Vec<String>,
+) -> openshell_supervisor_middleware::WebSocketPreflightInput {
+    openshell_supervisor_middleware::WebSocketPreflightInput {
+        session_id: uuid::Uuid::new_v4().to_string(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        sandbox_id: sandbox.sandbox_id.clone(),
+        sandbox_name: sandbox.sandbox_name.clone(),
+        workspace: ctx.workspace.clone(),
+        scheme: scheme.to_string(),
+        host: ctx.host.clone(),
+        port: ctx.port,
+        path: req.target.clone(),
+        requested_subprotocols,
+    }
 }
 
 /// Handle an upgraded connection (101 Switching Protocols).
@@ -2871,6 +2891,45 @@ mod tests {
     }
 
     #[test]
+    fn websocket_preflight_input_carries_real_sandbox_name() {
+        let sandbox = openshell_ocsf::SandboxContext {
+            sandbox_id: "sbx-123".into(),
+            sandbox_name: "nightly-build".into(),
+            container_image: String::new(),
+            hostname: "h".into(),
+            product_version: "0".into(),
+            proxy_ip: [127, 0, 0, 1].into(),
+            proxy_port: 3128,
+        };
+
+        let eval = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            workspace: "team-a".into(),
+            policy_name: "api-policy".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+            secret_resolver: None,
+            ..Default::default()
+        };
+        let req = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/v1/stream".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+
+        let input =
+            websocket_preflight_input(&sandbox, &eval, &req, "wss", vec!["chat".to_string()]);
+
+        assert_eq!(input.sandbox_id, "sbx-123");
+        assert_eq!(input.sandbox_name, "nightly-build");
+        assert_eq!(input.workspace, "team-a");
+    }
+
+    #[test]
     fn scoped_context_captures_endpoint_resolver_and_revision_together() {
         let state = ProviderCredentialState::from_bound_environment(
             42,
@@ -3272,6 +3331,37 @@ network_policies:
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
+
+        (config, tunnel_engine, ctx, fixture)
+    }
+
+    fn rest_token_exchange_relay_context(
+        resolver_response: std::result::Result<&str, &str>,
+    ) -> (
+        L7EndpointConfig,
+        TunnelPolicyEngine,
+        L7EvalContext,
+        crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
+    ) {
+        let (config, tunnel_engine, mut ctx, _) =
+            rest_token_grant_relay_context(Ok("unused-token"));
+        let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let fixture = match resolver_response {
+            Ok(token) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success_token_exchange(
+                    provider_key,
+                    token,
+                )
+            }
+            Err(error) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::failure_token_exchange(
+                    provider_key,
+                    error,
+                )
+            }
+        };
+        ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+        ctx.token_grant_resolver = Some(fixture.resolver());
 
         (config, tunnel_engine, ctx, fixture)
     }
@@ -3684,6 +3774,36 @@ network_policies:
         .await;
     }
 
+    fn passthrough_token_exchange_relay_context(
+        resolver_response: std::result::Result<&str, &str>,
+    ) -> (
+        PolicyGenerationGuard,
+        L7EvalContext,
+        crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
+    ) {
+        let (generation_guard, mut ctx, _) =
+            passthrough_token_grant_relay_context(Ok("unused-token"));
+        let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let fixture = match resolver_response {
+            Ok(token) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success_token_exchange(
+                    provider_key,
+                    token,
+                )
+            }
+            Err(error) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::failure_token_exchange(
+                    provider_key,
+                    error,
+                )
+            }
+        };
+        ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+        ctx.token_grant_resolver = Some(fixture.resolver());
+
+        (generation_guard, ctx, fixture)
+    }
+
     fn jsonrpc_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
         jsonrpc_test_relay_context_with_path("/rpc")
     }
@@ -4056,6 +4176,128 @@ network_policies:
         assert_eq!(n, 0, "unauthenticated request must not reach upstream");
 
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn l7_rest_relay_injects_token_exchange_authorization_header() {
+        let (config, tunnel_engine, ctx, fixture) =
+            rest_token_exchange_relay_context(Ok("grant-token"));
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut upstream_request = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("request should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_request[..n]);
+
+        assert!(
+            upstream_request.starts_with("GET /v1/projects HTTP/1.1\r\n"),
+            "unexpected upstream request: {upstream_request:?}"
+        );
+        assert!(upstream_request.contains("Authorization: Bearer grant-token\r\n"));
+        assert!(!upstream_request.contains("stale-token"));
+        assert_eq!(authorization_header_count(&upstream_request), 1);
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("204 No Content"));
+        drop(app);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+
+        fixture.assert_one_token_exchange_request(
+            "api.example.test\t8080\t/v1/**\tprovider:access_token",
+        );
+    }
+
+    #[tokio::test]
+    async fn l7_rest_relay_token_exchange_failure_does_not_forward_request() {
+        let (config, tunnel_engine, ctx, fixture) =
+            rest_token_exchange_relay_context(Err("oauth unavailable"));
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("bad gateway response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
+
+        let mut upstream_request = [0u8; 128];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("upstream should close without forwarded data")
+        .unwrap();
+        assert_eq!(n, 0, "unauthenticated request must not reach upstream");
+
+        fixture.assert_one_token_exchange_request(
+            "api.example.test\t8080\t/v1/**\tprovider:access_token",
+        );
     }
 
     #[tokio::test]
@@ -5911,6 +6153,7 @@ network_policies:
         };
 
         let input = middleware_request_input(
+            openshell_ocsf::ctx::ctx(),
             "http",
             &req,
             &ctx,
@@ -6412,6 +6655,125 @@ network_policies:
         assert_eq!(n, 0, "unauthenticated request must not reach upstream");
 
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn passthrough_relay_injects_token_exchange_authorization_header() {
+        let (generation_guard, ctx, fixture) =
+            passthrough_token_exchange_relay_context(Ok("grant-token"));
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                None,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut upstream_request = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("request should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_request[..n]);
+
+        assert!(upstream_request.starts_with("GET /v1/projects HTTP/1.1\r\n"));
+        assert!(upstream_request.contains("Authorization: Bearer grant-token\r\n"));
+        assert!(!upstream_request.contains("stale-token"));
+        assert_eq!(authorization_header_count(&upstream_request), 1);
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("204 No Content"));
+        drop(app);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+
+        fixture.assert_one_token_exchange_request(
+            "api.example.test\t8080\t/v1/**\tprovider:access_token",
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_relay_token_exchange_failure_returns_bad_gateway_without_forwarding() {
+        let (generation_guard, ctx, fixture) =
+            passthrough_token_exchange_relay_context(Err("oauth unavailable"));
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                None,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("bad gateway response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
+
+        let mut upstream_request = [0u8; 128];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("upstream should close without forwarded data")
+        .unwrap();
+        assert_eq!(n, 0, "unauthenticated request must not reach upstream");
+
+        fixture.assert_one_token_exchange_request(
+            "api.example.test\t8080\t/v1/**\tprovider:access_token",
+        );
     }
 
     #[test]
