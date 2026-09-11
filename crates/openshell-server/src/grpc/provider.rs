@@ -2096,6 +2096,9 @@ pub(super) async fn handle_create_provider(
         ));
     }
     let provider_type = provider.r#type.clone();
+    if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
+        state.compute.ensure_workspace(&workspace).await?;
+    }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3397,6 +3400,9 @@ pub(super) async fn handle_update_provider(
             "subscription OAuth credentials and routing metadata are gateway-managed; use provider login or logout",
         ));
     }
+    if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
+        state.compute.ensure_workspace(&workspace).await?;
+    }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3910,6 +3916,7 @@ pub(super) async fn handle_rotate_provider_credential(
         state.store.as_ref(),
         &workspace,
         Some(&state.credentials),
+        Some(&state.compute),
         provider_name,
         credential_key,
     )

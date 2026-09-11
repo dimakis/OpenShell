@@ -5,7 +5,7 @@ use super::*;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE,
+    LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -102,6 +102,10 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             ),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         },
+        gateway_callback_bind_address: Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+        )),
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
@@ -186,6 +190,7 @@ async fn gateway_listener_requirements_report_managed_bridge_address() {
 async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
     let mut config = runtime_config();
     config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = None;
     let driver = test_driver_with_config(config);
 
     let response = driver
@@ -195,6 +200,26 @@ async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
         .into_inner();
 
     assert!(response.requirements.is_empty());
+}
+
+#[tokio::test]
+async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = Some("127.0.0.1:17670".parse().unwrap());
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress("127.0.0.1:17670".to_string()))
+    );
 }
 
 #[test]
@@ -296,6 +321,31 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
             "host.openshell.internal:host-gateway".to_string()
         ]
     );
+}
+
+#[test]
+fn host_gateway_route_requests_ipv4_loopback_for_ipv6_primary() {
+    assert_eq!(
+        docker_gateway_callback_bind_address(
+            &DockerGatewayRoute::HostGateway,
+            "[::1]:17670".parse().unwrap(),
+        ),
+        Some("127.0.0.1:17670".parse().unwrap())
+    );
+}
+
+#[test]
+fn host_gateway_route_reuses_ipv4_primary_when_it_covers_loopback() {
+    for primary in ["127.0.0.1:17670", "0.0.0.0:17670"] {
+        assert_eq!(
+            docker_gateway_callback_bind_address(
+                &DockerGatewayRoute::HostGateway,
+                primary.parse().unwrap(),
+            ),
+            None,
+            "{primary} already covers the IPv4 loopback callback"
+        );
+    }
 }
 
 #[test]
@@ -2195,7 +2245,7 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
     fs::write(&path, b"not-elf").unwrap();
 
     let err = validate_linux_elf_binary(&path).unwrap_err();
-    assert!(err.to_string().contains("Linux ELF executable"));
+    assert!(err.contains("Linux ELF executable"));
 }
 
 #[test]
@@ -2401,8 +2451,11 @@ fn docker_supervisor_image_refreshes_mutable_tags_only() {
 #[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
-    let path =
-        supervisor_cache_path_with_base(&base, "sha256:abc123deadbeef0123456789cafe0123456789fe");
+    let path = supervisor_cache_path_with_base(
+        &base,
+        "docker-supervisor",
+        "sha256:abc123deadbeef0123456789cafe0123456789fe",
+    );
 
     assert_eq!(
         path,
@@ -2415,8 +2468,8 @@ fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
 #[test]
 fn supervisor_cache_path_isolates_different_digests() {
     let base = PathBuf::from("/data");
-    let left = supervisor_cache_path_with_base(&base, "sha256:aaaaaaaa");
-    let right = supervisor_cache_path_with_base(&base, "sha256:bbbbbbbb");
+    let left = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:aaaaaaaa");
+    let right = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:bbbbbbbb");
     assert_ne!(
         left.parent().unwrap(),
         right.parent().unwrap(),
