@@ -29,7 +29,9 @@ type SandboxSpec struct {
 	InferenceProvider string
 	InferenceModel    string
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
-	Policy *SandboxPolicy
+	Policy  *SandboxPolicy
+	Command []string
+	TTY     bool
 }
 
 // SandboxTemplate defines the container template for a sandbox.
@@ -54,6 +56,7 @@ type SandboxStatus struct {
 	Phase                SandboxPhase
 	Conditions           []SandboxCondition
 	CurrentPolicyVersion uint32
+	ExitCode             *int32
 }
 
 // SandboxCondition describes an observed condition of a sandbox.
