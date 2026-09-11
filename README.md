@@ -20,8 +20,6 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 
 Users of the `saariuslystoned` downstream should follow [SAARI_DOWNSTREAM.md](SAARI_DOWNSTREAM.md) for the maintained OpenShell/NemoClaw release pair, subscription-provider scope, and upgrade contract.
 
-> **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one gateway. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
-
 ## Quickstart
 
 ### Prerequisites
