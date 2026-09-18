@@ -6045,11 +6045,27 @@ async fn handle_forward_proxy(
                 crate::l7::relay::reject_credential_resolution(client, &l7_ctx, error).await?;
                 return Ok(());
             }
-            if crate::l7::relay::handle_streamed_body_credential_placeholder_denial(
-                &report, client, &l7_ctx,
-            )
-            .await?
+            if report
+                .downcast_ref::<crate::l7::rest::StreamedBodyCredentialPlaceholderDenied>()
+                .is_some()
             {
+                // Preserve forward-proxy accounting before the best-effort
+                // client response; a reset client must not erase this denial.
+                emit_activity_simple(activity_tx, true, "credential_placeholder");
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    "credential_placeholder_denied",
+                    "forward-credential-placeholder",
+                );
+                let handled = crate::l7::relay::handle_streamed_body_credential_placeholder_denial(
+                    &report, client, &l7_ctx,
+                )
+                .await?;
+                debug_assert!(handled, "typed placeholder denial must be handled");
                 if let Some(session) = middleware_session.take() {
                     session
                         .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
