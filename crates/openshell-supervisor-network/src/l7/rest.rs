@@ -792,6 +792,15 @@ fn ensure_credential_generation_current(options: RelayRequestOptions<'_>) -> Res
     Ok(())
 }
 
+fn ensure_streaming_credential_generation(
+    guard: Option<CredentialGenerationGuard<'_>>,
+) -> Result<()> {
+    if let Some(guard) = guard {
+        guard.ensure_current()?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
     req: &L7Request,
     client: &mut C,
@@ -1267,6 +1276,10 @@ impl<'a> ReservedMarkerStreamGuard<'a> {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stream relay requires request framing, both transports, resolver, and generation guards"
+)]
 async fn relay_request_body_with_marker_guard<C, U>(
     req: &L7Request,
     client: &mut C,
@@ -1284,17 +1297,13 @@ where
     let resolver = resolver.ok_or_else(|| {
         miette!("request body credential guard cannot initialize without an active resolver")
     })?;
-    if let Some(guard) = credential_generation {
-        guard.ensure_current()?;
-    }
+    ensure_streaming_credential_generation(credential_generation)?;
     upstream.write_all(headers).await.into_diagnostic()?;
     match req.body_length {
         BodyLength::None => {
             let mut scanner = ReservedMarkerStreamGuard::new(resolver);
             let safe = scanner.push(already_read)?;
-            if let Some(guard) = credential_generation {
-                guard.ensure_current()?;
-            }
+            ensure_streaming_credential_generation(credential_generation)?;
             upstream.write_all(&safe).await.into_diagnostic()?;
             upstream
                 .write_all(&scanner.finish()?)
@@ -1307,9 +1316,7 @@ where
                 .min(already_read.len());
             let mut scanner = ReservedMarkerStreamGuard::new(resolver);
             let safe = scanner.push(&already_read[..initial_len])?;
-            if let Some(guard) = credential_generation {
-                guard.ensure_current()?;
-            }
+            ensure_streaming_credential_generation(credential_generation)?;
             upstream.write_all(&safe).await.into_diagnostic()?;
             let mut remaining = len.saturating_sub(initial_len as u64);
             let mut buf = vec![0u8; RELAY_BUF_SIZE];
@@ -1327,9 +1334,7 @@ where
                     guard.ensure_current()?;
                 }
                 let safe = scanner.push(&buf[..n])?;
-                if let Some(guard) = credential_generation {
-                    guard.ensure_current()?;
-                }
+                ensure_streaming_credential_generation(credential_generation)?;
                 upstream.write_all(&safe).await.into_diagnostic()?;
                 remaining -= n as u64;
             }
@@ -1386,9 +1391,7 @@ where
     let mut scanner = ReservedMarkerStreamGuard::new(resolver);
 
     loop {
-        if let Some(guard) = credential_generation {
-            guard.ensure_current()?;
-        }
+        ensure_streaming_credential_generation(credential_generation)?;
         let size_line = read_chunked_line(client, already_read, &mut read_state, generation_guard)
             .await
             .map_err(CollectChunkedError::into_report)?;
@@ -6826,6 +6829,28 @@ mod tests {
             forwarded.is_empty(),
             "stale request bytes must not reach upstream"
         );
+    }
+
+    #[test]
+    fn streaming_credential_generation_aborts_fixed_and_chunked_before_next_write() {
+        let state =
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                1,
+                HashMap::new(),
+            );
+        let guard = CredentialGenerationGuard::new(&state, 1);
+        // This models rotation after a previous body block was written. Both
+        // framing loops call this shared seam immediately before their next
+        // scanner/write boundary.
+        state.revoke_static_provider_environment(2);
+        for framing in ["content-length", "chunked"] {
+            let error = ensure_streaming_credential_generation(Some(guard))
+                .expect_err("rotation must abort before the next upstream write");
+            assert!(
+                error.to_string().contains("credential generation changed"),
+                "{framing}"
+            );
+        }
     }
 
     #[test]
