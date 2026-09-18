@@ -10,6 +10,17 @@ use std::sync::Arc;
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 const PROVIDER_ALIAS_MARKER: &str = "OPENSHELL-RESOLVE-ENV-";
 
+fn active_identities(by_placeholder: &HashMap<String, SecretValue>) -> HashSet<String> {
+    by_placeholder
+        .keys()
+        .flat_map(|placeholder| {
+            let alias =
+                placeholder_env_key(placeholder).map(|key| format!("{PROVIDER_ALIAS_MARKER}{key}"));
+            std::iter::once(placeholder.clone()).chain(alias)
+        })
+        .collect()
+}
+
 /// Public access to the placeholder prefix for fail-closed scanning in other modules.
 pub const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
 pub const PROVIDER_ALIAS_MARKER_PUBLIC: &str = PROVIDER_ALIAS_MARKER;
@@ -148,6 +159,9 @@ pub struct RewriteTargetResult {
 #[derive(Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
+    /// Issued identities are retained when this resolver is endpoint-scoped.
+    /// They are safe to compare but never grant substitution authority.
+    active_identities: HashSet<String>,
     denied_env_keys: HashSet<String>,
     identity_bound_env_keys: HashSet<String>,
     revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
@@ -198,16 +212,16 @@ impl SecretResolver {
     #[must_use]
     pub fn active_placeholder_scan_tail_bytes(&self) -> usize {
         let known = self
-            .by_placeholder
-            .keys()
+            .active_identities
+            .iter()
             .map(|placeholder| placeholder.len().saturating_mul(3))
             .max()
             .unwrap_or_default();
         // Revision fallback can redeem a token whose revision is not present
         // in `by_placeholder`; reserve space for the largest u64 revision.
         let fallback = self
-            .by_placeholder
-            .keys()
+            .active_identities
+            .iter()
             .filter_map(|placeholder| placeholder_env_key(placeholder))
             .map(|key| (PLACEHOLDER_PREFIX.len() + 1 + 20 + 1 + key.len()) * 3)
             .max()
@@ -216,26 +230,9 @@ impl SecretResolver {
     }
 
     fn contains_active_placeholder_raw(&self, value: &str) -> bool {
-        let mut search_from = 0;
-        while search_from < value.len() {
-            let remainder = &value[search_from..];
-            let canonical = remainder
-                .find(PLACEHOLDER_PREFIX)
-                .map(|offset| search_from + offset);
-            let alias = remainder
-                .find(PROVIDER_ALIAS_MARKER)
-                .map(|offset| alias_start_for_marker(value, search_from + offset));
-            let Some(start) = [canonical, alias].into_iter().flatten().min() else {
-                return false;
-            };
-            if let Some((_, token)) = self.credential_token_at(value, start)
-                && self.resolve_placeholder(token).is_some()
-            {
-                return true;
-            }
-            search_from = start.saturating_add(1);
-        }
-        false
+        self.active_identities
+            .iter()
+            .any(|identity| value.contains(identity))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -319,6 +316,7 @@ impl SecretResolver {
 
         let resolver = |by_placeholder: HashMap<String, SecretValue>| {
             (!by_placeholder.is_empty()).then_some(Self {
+                active_identities: active_identities(&by_placeholder),
                 by_placeholder,
                 denied_env_keys: HashSet::new(),
                 identity_bound_env_keys: HashSet::new(),
@@ -374,6 +372,7 @@ impl SecretResolver {
             (
                 child_env,
                 Some(Self {
+                    active_identities: active_identities(&by_placeholder),
                     by_placeholder,
                     denied_env_keys: HashSet::new(),
                     identity_bound_env_keys: HashSet::new(),
@@ -385,11 +384,13 @@ impl SecretResolver {
 
     pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
         let mut by_placeholder = HashMap::new();
+        let mut active_identities = HashSet::new();
         let mut denied_env_keys = HashSet::new();
         let mut identity_bound_env_keys = HashSet::new();
         let mut revision_fallback_allowed_revisions = HashMap::new();
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
+            active_identities.extend(resolver.active_identities.iter().cloned());
             denied_env_keys.extend(resolver.denied_env_keys.iter().cloned());
             identity_bound_env_keys.extend(resolver.identity_bound_env_keys.iter().cloned());
             revision_fallback_allowed_revisions
@@ -400,6 +401,7 @@ impl SecretResolver {
         } else {
             Some(Self {
                 by_placeholder,
+                active_identities,
                 denied_env_keys,
                 identity_bound_env_keys,
                 revision_fallback_allowed_revisions,
@@ -433,6 +435,7 @@ impl SecretResolver {
             .collect();
         Self {
             by_placeholder,
+            active_identities: self.active_identities.clone(),
             denied_env_keys,
             identity_bound_env_keys: bound_keys.clone(),
             revision_fallback_allowed_revisions,
@@ -1506,6 +1509,35 @@ mod tests {
             "openshell:resolve:env:saaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_OPENAI_API_KEY"
         ));
         assert!(current.contains_active_placeholder("vendor-OPENSHELL-RESOLVE-ENV-OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn active_placeholder_scan_blocks_issued_identity_with_attacker_suffix_and_after_scoping() {
+        let (_, resolver) = SecretResolver::from_provider_env_for_revision(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+            HashMap::new(),
+            9,
+        );
+        let resolver = resolver.expect("resolver");
+        let scoped = resolver.scoped_to_env_keys(
+            &["API_TOKEN".to_string()].into_iter().collect(),
+            &HashSet::new(),
+            HashMap::new(),
+        );
+        for value in [
+            "openshell:resolve:env:v9_API_TOKENX",
+            "openshell%3Aresolve%3Aenv%3Av9_API_TOKENX",
+            "OPENSHELL-RESOLVE-ENV-API_TOKENX",
+        ] {
+            assert!(scoped.contains_active_placeholder(value));
+        }
+        assert!(
+            scoped
+                .resolve_placeholder("openshell:resolve:env:v9_API_TOKEN")
+                .is_none()
+        );
     }
 
     // === Existing tests (preserved) ===

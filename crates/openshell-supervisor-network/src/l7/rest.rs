@@ -1238,7 +1238,11 @@ impl<'a> ReservedMarkerStreamGuard<'a> {
                 .join(",");
             let count = self.shape_families.len().to_string();
             openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .action(openshell_ocsf::ActionId::Allowed)
+                .disposition(openshell_ocsf::DispositionId::Allowed)
                 .severity(openshell_ocsf::SeverityId::Low)
+                .confidence(openshell_ocsf::ConfidenceId::Low)
+                .is_alert(false)
                 .finding_info(openshell_ocsf::FindingInfo::new(
                     "openshell.credentials.shape_observed",
                     "Credential-shaped request content observed",
@@ -7371,6 +7375,9 @@ mod tests {
         assert!(serialized.contains("aws"));
         assert!(serialized.contains("jwt"));
         assert!(serialized.contains("\"count\":\"4\""));
+        assert!(serialized.contains("\"action\":\"Allowed\""));
+        assert!(serialized.contains("\"disposition\":\"Allowed\""));
+        assert!(serialized.contains("\"is_alert\":false"));
         for forbidden in [
             "sk-proj-inert",
             "ghp_fixture",
