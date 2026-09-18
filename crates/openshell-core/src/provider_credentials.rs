@@ -2140,6 +2140,10 @@ mod tests {
             resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("new-19")
         );
+        assert!(
+            resolver.contains_active_placeholder("openshell%3Aresolve%3Aenv%3Av10_GITHUB_TOKENX"),
+            "the streamed guard must retain resolver fallback identities beyond the bounded generation queue"
+        );
     }
 
     #[test]

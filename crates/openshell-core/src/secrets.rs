@@ -189,20 +189,21 @@ impl fmt::Debug for SecretResolver {
 }
 
 impl SecretResolver {
-    /// Returns whether `value` contains a placeholder that this resolver can
-    /// currently redeem. This intentionally differs from
+    /// Returns whether `value` contains a placeholder identity that must not
+    /// be forwarded by a streamed request guard. This intentionally differs from
     /// [`contains_reserved_credential_marker`]: the latter is a syntax check
     /// used by rewrite paths, while this method is for streamed DLP guards
     /// where documentation and inactive examples must remain forwardable.
     ///
-    /// The check accepts the same canonical, revisioned, stable-handle, and
-    /// provider-alias representations as `resolve_placeholder`, including a
-    /// supported percent-encoded wire representation. It never returns or
-    /// logs the matched token or secret.
+    /// The check blocks every identity that `resolve_placeholder` can redeem,
+    /// plus endpoint-mismatched identities. It also retains issued stable and
+    /// revision identities after endpoint scoping. Matching is secret-free and
+    /// includes supported percent-encoded wire representations; it never
+    /// returns or logs a matched token or secret.
     pub fn contains_active_placeholder(&self, value: &str) -> bool {
-        self.contains_active_placeholder_raw(value) || {
+        self.contains_guarded_placeholder_raw(value) || {
             let decoded = percent_decode(value);
-            decoded != value && self.contains_active_placeholder_raw(&decoded)
+            decoded != value && self.contains_guarded_placeholder_raw(&decoded)
         }
     }
 
@@ -220,19 +221,91 @@ impl SecretResolver {
         // Revision fallback can redeem a token whose revision is not present
         // in `by_placeholder`; reserve space for the largest u64 revision.
         let fallback = self
-            .active_identities
-            .iter()
-            .filter_map(|placeholder| placeholder_env_key(placeholder))
+            .guarded_env_keys()
+            .into_iter()
             .map(|key| (PLACEHOLDER_PREFIX.len() + 1 + 20 + 1 + key.len()) * 3)
             .max()
             .unwrap_or_default();
         known.max(fallback)
     }
 
-    fn contains_active_placeholder_raw(&self, value: &str) -> bool {
-        self.active_identities
+    fn guarded_env_keys(&self) -> HashSet<&str> {
+        self.by_placeholder
+            .keys()
+            .chain(self.active_identities.iter())
+            .filter_map(|identity| placeholder_env_key(identity))
+            .chain(self.denied_env_keys.iter().map(String::as_str))
+            .chain(self.identity_bound_env_keys.iter().map(String::as_str))
+            .chain(
+                self.revision_fallback_allowed_revisions
+                    .keys()
+                    .map(String::as_str),
+            )
+            .collect()
+    }
+
+    fn contains_guarded_placeholder_raw(&self, value: &str) -> bool {
+        // Issued stable handles and exact historical identities are opaque, so
+        // retain exact matching for them. `contains` deliberately has no token
+        // boundary: an attacker must not bypass a known identity by appending an
+        // environment-key byte.
+        if self
+            .active_identities
             .iter()
             .any(|identity| value.contains(identity))
+        {
+            return true;
+        }
+
+        self.guarded_env_keys().into_iter().any(|key| {
+            let denied = self.denied_env_keys.contains(key);
+            let bound = self.identity_bound_env_keys.contains(key);
+            // Unbound aliases resolve through the canonical fallback; denied
+            // aliases classify as EndpointMismatch. Bound allowed aliases do
+            // not carry an identity and remain forwardable unless issued above.
+            (denied || !bound) && value.contains(&format!("{PROVIDER_ALIAS_MARKER}{key}"))
+                || self.contains_guarded_revision_prefix(value, key, denied, bound)
+        })
+    }
+
+    fn contains_guarded_revision_prefix(
+        &self,
+        value: &str,
+        key: &str,
+        denied: bool,
+        bound: bool,
+    ) -> bool {
+        let stem = format!("{PLACEHOLDER_PREFIX}v");
+        let mut search_from = 0;
+        while let Some(found) = value[search_from..].find(&stem) {
+            let start = search_from + found + stem.len();
+            let bytes = value.as_bytes();
+            let digit_len = bytes[start..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            let revision_end = start + digit_len;
+            let revision = &value[start..revision_end];
+            let suffix = value.get(revision_end..).unwrap_or_default();
+            if canonical_revision(revision)
+                && suffix
+                    .strip_prefix('_')
+                    .is_some_and(|rest| rest.starts_with(key))
+                && (denied
+                    || !bound
+                    || self
+                        .revision_fallback_allowed_revisions
+                        .get(key)
+                        .is_some_and(|revisions| {
+                            revisions.contains(&revision.parse().unwrap_or(0))
+                        }))
+            {
+                return true;
+            }
+            // Progress past the marker even when its candidate is malformed.
+            search_from = start;
+        }
+        false
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -829,16 +902,21 @@ pub fn uses_reserved_revision_namespace(key: &str) -> bool {
 fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
     let suffix = key.strip_prefix('v')?;
     let (revision, env_key) = suffix.split_once('_')?;
-    if revision.is_empty()
-        || revision.len() > 20
-        || (revision.len() > 1 && revision.starts_with('0'))
-        || !revision.bytes().all(|b| b.is_ascii_digit())
-        || env_key.is_empty()
-        || !env_key.bytes().all(is_env_key_char)
+    if !canonical_revision(revision) || env_key.is_empty() || !env_key.bytes().all(is_env_key_char)
     {
         return None;
     }
     Some((revision, env_key))
+}
+
+/// Canonical lexical form for a resolver revision. Keeping this shared with
+/// the streaming identity matcher prevents a larger wire spelling from
+/// escaping its bounded carry window.
+fn canonical_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && revision.len() <= 20
+        && (revision.len() == 1 || !revision.starts_with('0'))
+        && revision.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn split_stable_env_key(key: &str) -> Option<(&str, &str)> {
@@ -1486,7 +1564,9 @@ mod tests {
         assert!(!resolver.contains_active_placeholder(
             "ghp_abcdefghijklmnopqrstuvwxyz1234567890 JWT eyJhbGciOiJIUzI1NiJ9.abc.def AKIAIOSFODNN7EXAMPLE"
         ));
-        assert!(!resolver.contains_active_placeholder("openshell:resolve:env:v6_OPENAI_API_KEY"));
+        // Unbound canonical revisions intentionally fall back by known key,
+        // even after a concrete generation has aged out of the identity set.
+        assert!(resolver.contains_active_placeholder("openshell:resolve:env:v6_OPENAI_API_KEY"));
         assert!(resolver.contains_active_placeholder("openshell:resolve:env:v7_OPENAI_API_KEY"));
         assert!(
             resolver.contains_active_placeholder("openshell%3Aresolve%3Aenv%3Av7_OPENAI_API_KEY")
@@ -1560,6 +1640,72 @@ mod tests {
         ] {
             assert!(resolver.resolve_placeholder(&value).is_none());
             assert!(!resolver.contains_active_placeholder(&value));
+        }
+    }
+
+    #[test]
+    fn stream_guard_matches_every_redeemable_or_endpoint_mismatched_identity() {
+        let (_, base) = SecretResolver::from_provider_env_for_revision(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+            HashMap::new(),
+            9,
+        );
+        let base = base.expect("base resolver");
+        let bound: HashSet<String> = ["API_TOKEN".to_string()].into_iter().collect();
+        let allowed = bound.clone();
+        let scoped_allowed = base.scoped_to_env_keys(
+            &bound,
+            &allowed,
+            [(
+                "API_TOKEN".to_string(),
+                Arc::new([9, 777].into_iter().collect()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let scoped_denied = base.scoped_to_env_keys(&bound, &HashSet::new(), HashMap::new());
+
+        let cases = [
+            (&base, "openshell:resolve:env:v777_API_TOKEN", true),
+            (&base, "openshell%3Aresolve%3Aenv%3Av777_API_TOKENX", true),
+            (
+                &scoped_allowed,
+                "openshell:resolve:env:v777_API_TOKEN",
+                true,
+            ),
+            (
+                &scoped_allowed,
+                "openshell:resolve:env:v778_API_TOKEN",
+                false,
+            ),
+            (
+                &scoped_denied,
+                "openshell:resolve:env:v778_API_TOKENX",
+                true,
+            ),
+            (
+                &scoped_denied,
+                "vendor-OPENSHELL-RESOLVE-ENV-API_TOKENX",
+                true,
+            ),
+            (&base, "openshell:resolve:env:v777_UNKNOWN_KEY", false),
+            (&base, "openshell:resolve:env:v007_API_TOKEN", false),
+            (&base, "openshell:resolve:env:...", false),
+        ];
+        for (resolver, value, expected) in cases {
+            let resolved_or_mismatched = resolver.resolve_placeholder(value).is_some()
+                || resolver.resolve_placeholder_checked(value, "test").is_err();
+            assert_eq!(
+                resolver.contains_active_placeholder(value),
+                expected,
+                "guard classification for {value:?}"
+            );
+            assert!(
+                !resolved_or_mismatched || resolver.contains_active_placeholder(value),
+                "redeemable or endpoint-mismatched identity was not guarded"
+            );
         }
     }
 
