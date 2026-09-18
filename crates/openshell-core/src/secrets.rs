@@ -1542,6 +1542,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn noncanonical_revision_spellings_are_not_redeemable_or_active() {
+        let (_, resolver) = SecretResolver::from_provider_env_for_revision(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+            HashMap::new(),
+            9,
+        );
+        let resolver = resolver.expect("resolver");
+        let overlong = format!("openshell:resolve:env:v{}9_API_TOKEN", "0".repeat(20));
+        for value in [
+            format!("openshell:resolve:env:v09_API_TOKEN"),
+            overlong,
+            "openshell%3Aresolve%3Aenv%3Av09_API_TOKEN".to_string(),
+        ] {
+            assert!(resolver.resolve_placeholder(&value).is_none());
+            assert!(!resolver.contains_active_placeholder(&value));
+        }
+    }
+
     // === Existing tests (preserved) ===
 
     #[test]
