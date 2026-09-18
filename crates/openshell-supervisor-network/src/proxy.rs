@@ -12216,14 +12216,11 @@ network_policies:
         (response, denial_stages)
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn forward_handler_streamed_placeholder_returns_accounted_denial() {
-        if !cfg!(target_os = "linux") {
-            return;
-        }
-        let Some(ip) = non_loopback_test_ipv4() else {
-            return;
-        };
+        let ip = non_loopback_test_ipv4()
+            .expect("Linux handler regression requires a non-loopback IPv4 address");
         let listener = Arc::new(TcpListener::bind((ip, 0)).await.unwrap());
         let port = listener.local_addr().unwrap().port();
         let exe = std::env::current_exe().unwrap();
