@@ -226,7 +226,16 @@ impl SecretResolver {
             .map(|key| (PLACEHOLDER_PREFIX.len() + 1 + 20 + 1 + key.len()) * 3)
             .max()
             .unwrap_or_default();
-        known.max(fallback)
+        // A denied endpoint classifies a syntactically-valid stable handle as
+        // EndpointMismatch even if that particular opaque handle was never
+        // issued. Preserve one complete encoded stable form across reads.
+        let denied_stable = self
+            .denied_env_keys
+            .iter()
+            .map(|key| (PLACEHOLDER_PREFIX.len() + 1 + 64 + 1 + key.len()) * 3)
+            .max()
+            .unwrap_or_default();
+        known.max(fallback).max(denied_stable)
     }
 
     fn guarded_env_keys(&self) -> HashSet<&str> {
@@ -265,6 +274,7 @@ impl SecretResolver {
             // not carry an identity and remain forwardable unless issued above.
             (denied || !bound) && value.contains(&format!("{PROVIDER_ALIAS_MARKER}{key}"))
                 || self.contains_guarded_revision_prefix(value, key, denied, bound)
+                || (denied && Self::contains_denied_stable_prefix(value, key))
         })
     }
 
@@ -304,6 +314,26 @@ impl SecretResolver {
             }
             // Progress past the marker even when its candidate is malformed.
             search_from = start;
+        }
+        false
+    }
+
+    fn contains_denied_stable_prefix(value: &str, key: &str) -> bool {
+        let stem = format!("{PLACEHOLDER_PREFIX}s");
+        let stable_len = stem.len() + 64 + 1 + key.len();
+        let mut search_from = 0;
+        while let Some(found) = value[search_from..].find(&stem) {
+            let start = search_from + found;
+            let end = start.saturating_add(stable_len);
+            if let Some(candidate) = value.get(start..end)
+                && stable_placeholder_parts(candidate)
+                    .is_some_and(|(_, found_key)| found_key == key)
+            {
+                // Matching a known denied identity prefix also closes the
+                // parser-boundary suffix bypass without inspecting values.
+                return true;
+            }
+            search_from = start + stem.len();
         }
         false
     }
@@ -1707,6 +1737,35 @@ mod tests {
                 "redeemable or endpoint-mismatched identity was not guarded"
             );
         }
+
+        let stable = format!("openshell:resolve:env:s{}_API_TOKEN", "a".repeat(64));
+        let encoded_stable = stable.replace(':', "%3A");
+        assert!(
+            scoped_denied
+                .resolve_placeholder_checked(&stable, "test")
+                .is_err(),
+            "denied stable form must preserve endpoint mismatch"
+        );
+        for value in [&stable, &encoded_stable] {
+            assert!(
+                scoped_denied.contains_active_placeholder(value),
+                "every endpoint-mismatched stable identity must be guarded"
+            );
+        }
+        for malformed in [
+            format!("openshell:resolve:env:s{}_API_TOKEN", "a".repeat(63)),
+            format!("openshell:resolve:env:s{}_API_TOKEN", "A".repeat(64)),
+            "documentation: openshell:resolve:env:s..._API_TOKEN".to_string(),
+        ] {
+            assert!(
+                !scoped_denied.contains_active_placeholder(&malformed),
+                "malformed stable example must remain forwardable"
+            );
+        }
+        assert!(
+            scoped_denied.active_placeholder_scan_tail_bytes() >= encoded_stable.len(),
+            "the carry window must retain a complete encoded denied stable identity"
+        );
     }
 
     // === Existing tests (preserved) ===

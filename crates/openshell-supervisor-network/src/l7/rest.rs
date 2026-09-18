@@ -7495,6 +7495,35 @@ mod tests {
     }
 
     #[test]
+    fn streamed_body_guard_detects_denied_stable_identity_split_across_encoded_reads() {
+        let (_, base) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let base = base.expect("base resolver");
+        let resolver = base.scoped_to_env_keys(
+            &["API_TOKEN".to_string()].into_iter().collect(),
+            &HashSet::new(),
+            HashMap::new(),
+        );
+        let stable = format!("openshell:resolve:env:s{}_API_TOKEN", "a".repeat(64));
+        let encoded = stable.replace(':', "%3A");
+        let (head, tail) = encoded.as_bytes().split_at(encoded.len() - 1);
+
+        let mut guard = ReservedMarkerStreamGuard::new(&resolver);
+        let forwarded = guard.push(head).expect("partial stable identity");
+        let error = guard
+            .push(tail)
+            .expect_err("encoded denied stable identity must be guarded");
+        assert!(error.to_string().contains("rewrite is disabled"));
+        assert!(
+            forwarded.is_empty(),
+            "no stable identity byte may escape early"
+        );
+    }
+
+    #[test]
     fn streamed_body_guard_observes_credential_shapes_across_boundaries_without_blocking() {
         let (_, resolver) = SecretResolver::from_provider_env(
             [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
