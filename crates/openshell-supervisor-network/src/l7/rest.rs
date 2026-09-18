@@ -1109,7 +1109,7 @@ where
             upstream.write_all(&body.body).await.into_diagnostic()?;
         }
     } else if options.deny_uninspected_credentials {
-        if let Err(error) = relay_request_body_with_marker_guard(
+        relay_request_body_with_marker_guard(
             req,
             client,
             upstream,
@@ -1119,13 +1119,7 @@ where
             options.credential_generation,
             options.generation_guard,
         )
-        .await
-        {
-            if error.to_string().contains("credential placeholder") {
-                emit_uninspected_body_credential_denial(req, &options);
-            }
-            return Err(error);
-        }
+        .await?;
     } else {
         ensure_credential_generation_current(options)?;
         upstream
@@ -1185,6 +1179,18 @@ struct ReservedMarkerStreamGuard<'a> {
     shape_families: BTreeSet<&'static str>,
 }
 
+/// A local policy decision made by the streamed-body guard. This is deliberately
+/// distinct from I/O, malformed framing, and generation failures so the L7
+/// orchestration layer can return a deterministic client denial without ever
+/// inspecting or reporting the matched bytes.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("OpenShell denied credential-placeholder traffic")]
+pub(crate) struct StreamedBodyCredentialPlaceholderDenied;
+
+fn streamed_body_credential_placeholder_denied() -> miette::Report {
+    miette::Report::new(StreamedBodyCredentialPlaceholderDenied)
+}
+
 /// Bounded, value-free observation retained until the relay has completed.
 /// Emitting it early would incorrectly report an allowed request that later
 /// failed generation validation or trailer inspection.
@@ -1210,9 +1216,7 @@ impl<'a> ReservedMarkerStreamGuard<'a> {
             .resolver
             .contains_active_placeholder(&String::from_utf8_lossy(&self.pending))
         {
-            return Err(miette!(
-                "request body credential placeholder denied because rewrite is disabled"
-            ));
+            return Err(streamed_body_credential_placeholder_denied());
         }
         let safe_len = self
             .pending
@@ -1226,9 +1230,7 @@ impl<'a> ReservedMarkerStreamGuard<'a> {
             .resolver
             .contains_active_placeholder(&String::from_utf8_lossy(&self.pending))
         {
-            return Err(miette!(
-                "request body credential placeholder denied because rewrite is disabled"
-            ));
+            return Err(streamed_body_credential_placeholder_denied());
         }
         Ok((
             std::mem::take(&mut self.pending),
@@ -1438,9 +1440,7 @@ where
                         .await
                         .map_err(CollectChunkedError::into_report)?;
                 if resolver.contains_active_placeholder(&String::from_utf8_lossy(&trailer)) {
-                    return Err(miette!(
-                        "request body credential placeholder denied because rewrite is disabled"
-                    ));
+                    return Err(streamed_body_credential_placeholder_denied());
                 }
                 write_streamed_body(upstream, &trailer, credential_generation).await?;
                 write_streamed_body(upstream, b"\r\n", credential_generation).await?;
@@ -1484,26 +1484,6 @@ where
             return Err(miette!("Chunk missing terminating CRLF"));
         }
     }
-}
-
-fn emit_uninspected_body_credential_denial(req: &L7Request, options: &RelayRequestOptions<'_>) {
-    let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(openshell_ocsf::ActivityId::Traffic)
-        .action(openshell_ocsf::ActionId::Denied)
-        .disposition(openshell_ocsf::DispositionId::Blocked)
-        .severity(openshell_ocsf::SeverityId::High)
-        .status(openshell_ocsf::StatusId::Failure)
-        .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
-            options.host,
-            options.port,
-        ))
-        .message(format!(
-            "{} request body credential traffic denied for {}:{}",
-            req.action, options.host, options.port
-        ))
-        .build();
-    openshell_ocsf::ocsf_emit!(event);
-    crate::l7::emit_uninspected_credential_finding(options.host, "", "http-request-body");
 }
 
 struct PreparedRequestBody {
@@ -7463,7 +7443,11 @@ mod tests {
         let error = guard
             .push(b"olve:env:API_TOKEN-suffix")
             .expect_err("split marker must be detected");
-        assert!(error.to_string().contains("rewrite is disabled"));
+        assert!(
+            error
+                .downcast_ref::<StreamedBodyCredentialPlaceholderDenied>()
+                .is_some()
+        );
     }
 
     /// Worst case for the retained window: a fully percent-encoded marker, the
@@ -7487,7 +7471,11 @@ mod tests {
             .push(tail)
             .expect_err("encoded marker completed across reads must be detected");
 
-        assert!(error.to_string().contains("rewrite is disabled"));
+        assert!(
+            error
+                .downcast_ref::<StreamedBodyCredentialPlaceholderDenied>()
+                .is_some()
+        );
         assert!(
             forwarded.is_empty(),
             "no marker byte may be forwarded early"
@@ -7516,7 +7504,11 @@ mod tests {
         let error = guard
             .push(tail)
             .expect_err("encoded denied stable identity must be guarded");
-        assert!(error.to_string().contains("rewrite is disabled"));
+        assert!(
+            error
+                .downcast_ref::<StreamedBodyCredentialPlaceholderDenied>()
+                .is_some()
+        );
         assert!(
             forwarded.is_empty(),
             "no stable identity byte may escape early"
@@ -7605,7 +7597,11 @@ mod tests {
         )
         .await
         .expect_err("placeholder must fail closed");
-        assert!(error.to_string().contains("rewrite is disabled"));
+        assert!(
+            error
+                .downcast_ref::<StreamedBodyCredentialPlaceholderDenied>()
+                .is_some()
+        );
 
         drop(proxy_upstream);
         let mut forwarded = Vec::new();
@@ -7632,7 +7628,11 @@ mod tests {
         )
         .await
         .expect_err("encoded placeholder must fail closed");
-        assert!(error.to_string().contains("rewrite is disabled"));
+        assert!(
+            error
+                .downcast_ref::<StreamedBodyCredentialPlaceholderDenied>()
+                .is_some()
+        );
         drop(upstream_writer);
         let mut forwarded = Vec::new();
         upstream_reader.read_to_end(&mut forwarded).await.unwrap();

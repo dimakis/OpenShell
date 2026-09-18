@@ -303,11 +303,62 @@ where
             if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
                 reject_credential_resolution(client, ctx, error).await?;
                 Ok(None)
+            } else if report
+                .downcast_ref::<crate::l7::rest::StreamedBodyCredentialPlaceholderDenied>()
+                .is_some()
+            {
+                reject_streamed_body_credential_placeholder(client, ctx).await?;
+                Ok(None)
             } else {
                 Err(report)
             }
         }
     }
+}
+
+/// Return a complete local policy response for a streamed-body identity denial.
+/// The typed error carries no request content; this response and its telemetry
+/// therefore stay independent of the matched placeholder or credential value.
+async fn reject_streamed_body_credential_placeholder<W>(
+    client: &mut W,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    const BODY: &str = r#"{"error":"credential_placeholder_denied","message":"OpenShell denied credential-placeholder traffic"}"#;
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+        BODY.len()
+    );
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+
+    ocsf_emit!(
+        HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Fail)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .status_detail("credential_placeholder_denied")
+            .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+            .firewall_rule(&ctx.policy_name, "credential-placeholder")
+            .message(format!(
+                "OpenShell denied credential-placeholder traffic for {}:{}",
+                ctx.host, ctx.port
+            ))
+            .build()
+    );
+    crate::l7::emit_uninspected_credential_finding(
+        &ctx.host,
+        &ctx.policy_name,
+        "http-request-body",
+    );
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3169,6 +3220,80 @@ mod tests {
         );
         assert_eq!(finding["action"], "Denied");
         assert_eq!(finding["disposition"], "Blocked");
+    }
+
+    #[tokio::test]
+    async fn streamed_body_placeholder_returns_sanitized_complete_policy_denial() {
+        let body = b"documentation openshell:resolve:env:API_TOKEN";
+        let split = body.len() - 5;
+        let mut raw_header = format!(
+            "POST /v1 HTTP/1.1\r\nHost: denied.example.test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw_header.extend_from_slice(&body[..split]);
+        let request = crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/v1".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header,
+            body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+        };
+        let (_, resolver) = SecretResolver::from_provider_env(TestHashMap::from([(
+            "API_TOKEN".to_string(),
+            "synthetic-test-secret".to_string(),
+        )]));
+        let resolver = resolver.expect("resolver");
+        let ctx = L7EvalContext {
+            host: "denied.example.test".to_string(),
+            port: 443,
+            policy_name: "credential-guard".to_string(),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        app.write_all(&body[split..]).await.unwrap();
+        app.shutdown().await.unwrap();
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(8192);
+
+        let outcome = relay_http_request_with_credential_rejection(
+            &request,
+            &mut relay_client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(&resolver),
+                deny_uninspected_credentials: true,
+                host: &ctx.host,
+                port: ctx.port,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await
+        .expect("typed body denial must be handled locally");
+        assert!(outcome.is_none());
+        drop(relay_client);
+        drop(upstream);
+
+        let mut response = String::new();
+        app.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.contains("Connection: close\r\n"));
+        assert!(response.contains("credential_placeholder_denied"));
+        assert!(response.contains("OpenShell denied credential-placeholder traffic"));
+        assert!(!response.contains("API_TOKEN"));
+        assert!(!response.contains("openshell:resolve"));
+        let length = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("content length");
+        let wire_body = response.split_once("\r\n\r\n").expect("HTTP framing").1;
+        assert_eq!(length, wire_body.len());
+
+        let mut forwarded = Vec::new();
+        upstream_peer.read_to_end(&mut forwarded).await.unwrap();
+        assert!(!String::from_utf8_lossy(&forwarded).contains("openshell:resolve"));
     }
 
     #[tokio::test]
