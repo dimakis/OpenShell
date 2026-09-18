@@ -12216,6 +12216,173 @@ network_policies:
         (response, denial_stages)
     }
 
+    #[tokio::test]
+    async fn forward_handler_streamed_placeholder_returns_accounted_denial() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let Some(ip) = non_loopback_test_ipv4() else {
+            return;
+        };
+        let listener = Arc::new(TcpListener::bind((ip, 0)).await.unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let exe = std::env::current_exe().unwrap();
+        let data = format!(
+            r#"network_policies:
+  allow:
+    name: allow
+    endpoints:
+      - host: "{ip}"
+        port: {port}
+        allowed_ips: ["{ip}/32"]
+        protocol: rest
+        enforcement: enforce
+        access: full
+        allow_uninspected_credentials: false
+    binaries:
+      - {{ path: "{}" }}
+"#,
+            exe.display()
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data).unwrap(),
+        );
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".into(), "synthetic-secret".into())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".into(),
+                openshell_core::proto::StaticCredentialBinding {
+                    endpoints: vec![openshell_core::proto::StaticCredentialEndpointBinding {
+                        host: ip.to_string(),
+                        port: u32::from(port),
+                        path: "/**".into(),
+                    }],
+                    credential_identity: "test:API_TOKEN".into(),
+                    workload_credential_handle: String::new(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .unwrap();
+        let marker = state.snapshot().child_env["API_TOKEN"].clone();
+        let resolver = state.resolver().unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+        let (activity_tx, mut activity_rx) = mpsc::channel(8);
+        let prefix = "openshell:resol";
+        let rest = marker.strip_prefix(prefix).unwrap().to_string();
+        let safe_body = "x".repeat(256);
+        let expected_safe_body = vec![b'x'; safe_body.len()];
+        let request = format!(
+            "POST http://{ip}:{port}/ HTTP/1.1\r\nHost: {ip}:{port}\r\nContent-Length: {}\r\n\r\n{}{}",
+            256 + marker.len(),
+            safe_body,
+            prefix
+        );
+        let (safe_bytes_forwarded_tx, safe_bytes_forwarded_rx) = tokio::sync::oneshot::channel();
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(proxy_addr).await.unwrap();
+            s.write_all(request.as_bytes()).await.unwrap();
+            safe_bytes_forwarded_rx.await.unwrap();
+            s.write_all(rest.as_bytes()).await.unwrap();
+            s.shutdown().await.unwrap();
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).await.unwrap();
+            out
+        });
+        let (server, _) = proxy_listener.accept().await.unwrap();
+        let handler = Box::pin(handle_tcp_connection(
+            server,
+            engine,
+            Arc::new(BinaryIdentityCache::new()),
+            Arc::new(AtomicU32::new(std::process::id())),
+            None,
+            None,
+            None,
+            AgentProposals::default(),
+            Arc::new(None),
+            Arc::new(None),
+            Some(state),
+            Some(resolver),
+            None,
+            Some(denial_tx),
+            Some(activity_tx),
+        ));
+        let capture_listener = Arc::clone(&listener);
+        let upstream = tokio::spawn(async move {
+            let (mut s, _) = capture_listener.accept().await.unwrap();
+            let mut b = Vec::new();
+            let mut read_buf = [0; 512];
+            let mut safe_bytes_forwarded_tx = Some(safe_bytes_forwarded_tx);
+            loop {
+                let read = s.read(&mut read_buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                b.extend_from_slice(&read_buf[..read]);
+                if b.windows(expected_safe_body.len())
+                    .any(|window| window == expected_safe_body)
+                    && let Some(tx) = safe_bytes_forwarded_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            }
+            b
+        });
+        handler.await.unwrap();
+        let response = String::from_utf8(client.await.unwrap()).unwrap();
+        let forwarded = upstream.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert_eq!(response.matches("HTTP/1.1 403 Forbidden").count(), 1);
+        assert!(response.contains("credential_placeholder_denied"));
+        assert!(response.contains("Connection: close"));
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let content_length = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(content_length, body.len());
+        assert!(!response.contains("API_TOKEN"));
+        assert!(!response.contains(&marker));
+        assert!(!response.contains("synthetic-secret"));
+        assert!(!String::from_utf8_lossy(&forwarded).contains(&marker));
+        assert!(
+            String::from_utf8_lossy(&forwarded).contains(&"x".repeat(256)),
+            "safe bytes must have reached the owned upstream before denial"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the terminal denial must drop the owned upstream without retrying"
+        );
+        let activities: Vec<_> = std::iter::from_fn(|| activity_rx.try_recv().ok()).collect();
+        let denials: Vec<_> = std::iter::from_fn(|| denial_rx.try_recv().ok()).collect();
+        assert_eq!(activities.len(), 1);
+        assert!(activities[0].denied);
+        assert_eq!(activities[0].deny_group, "credential_placeholder");
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0].deny_reason, "credential_placeholder_denied");
+        assert_eq!(denials[0].denial_stage, "forward-credential-placeholder");
+        assert_eq!(denials[0].host, ip.to_string());
+        assert_eq!(denials[0].port, port);
+        assert!(denials[0].l7_method.is_none());
+        assert!(denials[0].l7_path.is_none());
+        assert!(!denials[0].binary.contains(&marker));
+        assert!(
+            denials[0]
+                .ancestors
+                .iter()
+                .all(|ancestor| !ancestor.contains(&marker))
+        );
+    }
+
     /// End-to-end regression for the gator finding on PR #2162: with no TLS
     /// termination state, a terminating `CONNECT` must have its 503 written as
     /// the FIRST bytes on the socket — never after a `200 Connection
