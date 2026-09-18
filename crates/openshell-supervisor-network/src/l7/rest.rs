@@ -1185,6 +1185,14 @@ struct ReservedMarkerStreamGuard<'a> {
     shape_families: BTreeSet<&'static str>,
 }
 
+/// Bounded, value-free observation retained until the relay has completed.
+/// Emitting it early would incorrectly report an allowed request that later
+/// failed generation validation or trailer inspection.
+#[derive(Debug, Default)]
+struct CredentialShapeSummary {
+    families: BTreeSet<&'static str>,
+}
+
 impl<'a> ReservedMarkerStreamGuard<'a> {
     fn new(resolver: &'a SecretResolver) -> Self {
         Self {
@@ -1213,7 +1221,7 @@ impl<'a> ReservedMarkerStreamGuard<'a> {
         Ok(self.pending.drain(..safe_len).collect())
     }
 
-    fn finish(mut self) -> Result<Vec<u8>> {
+    fn finish(mut self) -> Result<(Vec<u8>, Option<CredentialShapeSummary>)> {
         if self
             .resolver
             .contains_active_placeholder(&String::from_utf8_lossy(&self.pending))
@@ -1222,8 +1230,12 @@ impl<'a> ReservedMarkerStreamGuard<'a> {
                 "request body credential placeholder denied because rewrite is disabled"
             ));
         }
-        self.emit_allowed_shape_finding();
-        Ok(std::mem::take(&mut self.pending))
+        Ok((
+            std::mem::take(&mut self.pending),
+            (!self.shape_families.is_empty()).then(|| CredentialShapeSummary {
+                families: std::mem::take(&mut self.shape_families),
+            }),
+        ))
     }
 
     fn observe_credential_shapes(&mut self, bytes: &[u8]) {
@@ -1246,42 +1258,40 @@ impl<'a> ReservedMarkerStreamGuard<'a> {
         self.shape_tail
             .extend_from_slice(&window[window.len() - keep..]);
     }
+}
 
-    fn allowed_shape_finding(&self) -> Option<openshell_ocsf::OcsfEvent> {
-        (!self.shape_families.is_empty()).then(|| {
-            let families = self
-                .shape_families
-                .iter()
-                .copied()
-                .collect::<Vec<_>>()
-                .join(",");
-            let count = self.shape_families.len().to_string();
-            openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-                .action(openshell_ocsf::ActionId::Allowed)
-                .disposition(openshell_ocsf::DispositionId::Allowed)
-                .severity(openshell_ocsf::SeverityId::Low)
-                .confidence(openshell_ocsf::ConfidenceId::Low)
-                .is_alert(false)
-                .finding_info(openshell_ocsf::FindingInfo::new(
-                    "openshell.credentials.shape_observed",
-                    "Credential-shaped request content observed",
-                ))
-                .evidence_pairs(&[
-                    ("families", families.as_str()),
-                    ("count", count.as_str()),
-                    ("confidence", "low"),
-                    ("location", "request_body"),
-                    ("disposition", "allowed"),
-                ])
-                .message("Credential-shaped request content allowed")
-                .build()
-        })
-    }
+fn allowed_shape_finding(summary: &CredentialShapeSummary) -> openshell_ocsf::OcsfEvent {
+    let families = summary
+        .families
+        .iter()
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",");
+    let count = summary.families.len().to_string();
+    openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .action(openshell_ocsf::ActionId::Allowed)
+        .disposition(openshell_ocsf::DispositionId::Allowed)
+        .severity(openshell_ocsf::SeverityId::Low)
+        .confidence(openshell_ocsf::ConfidenceId::Low)
+        .is_alert(false)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.credentials.shape_observed",
+            "Credential-shaped request content observed",
+        ))
+        .evidence_pairs(&[
+            ("families", families.as_str()),
+            ("count", count.as_str()),
+            ("confidence", "low"),
+            ("location", "request_body"),
+            ("disposition", "allowed"),
+        ])
+        .message("Credential-shaped request content allowed")
+        .build()
+}
 
-    fn emit_allowed_shape_finding(&self) {
-        if let Some(event) = self.allowed_shape_finding() {
-            openshell_ocsf::ocsf_emit!(event);
-        }
+fn emit_allowed_shape_finding(summary: Option<CredentialShapeSummary>) {
+    if let Some(summary) = summary {
+        openshell_ocsf::ocsf_emit!(allowed_shape_finding(&summary));
     }
 }
 
@@ -1314,7 +1324,9 @@ where
             let safe = scanner.push(already_read)?;
             ensure_streaming_credential_generation(credential_generation)?;
             write_streamed_body(upstream, &safe, credential_generation).await?;
-            write_streamed_body(upstream, &scanner.finish()?, credential_generation).await?;
+            let (tail, summary) = scanner.finish()?;
+            write_streamed_body(upstream, &tail, credential_generation).await?;
+            emit_allowed_shape_finding(summary);
         }
         BodyLength::ContentLength(len) => {
             let initial_len = usize::try_from(len)
@@ -1344,7 +1356,9 @@ where
                 write_streamed_body(upstream, &safe, credential_generation).await?;
                 remaining -= n as u64;
             }
-            write_streamed_body(upstream, &scanner.finish()?, credential_generation).await?;
+            let (tail, summary) = scanner.finish()?;
+            write_streamed_body(upstream, &tail, credential_generation).await?;
+            emit_allowed_shape_finding(summary);
         }
         BodyLength::Chunked => {
             relay_chunked_with_marker_guard(
@@ -1415,7 +1429,8 @@ where
             .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
 
         if chunk_size == 0 {
-            write_chunk(upstream, &scanner.finish()?, credential_generation).await?;
+            let (tail, summary) = scanner.finish()?;
+            write_chunk(upstream, &tail, credential_generation).await?;
             write_streamed_body(upstream, b"0\r\n", credential_generation).await?;
             loop {
                 let trailer =
@@ -1430,6 +1445,7 @@ where
                 write_streamed_body(upstream, &trailer, credential_generation).await?;
                 write_streamed_body(upstream, b"\r\n", credential_generation).await?;
                 if trailer.is_empty() {
+                    emit_allowed_shape_finding(summary);
                     return Ok(());
                 }
             }
@@ -7495,9 +7511,8 @@ mod tests {
                 .is_ok()
         );
 
-        let finding = guard
-            .allowed_shape_finding()
-            .expect("one aggregate finding");
+        let (_, summary) = guard.finish().expect("shape observations remain allowed");
+        let finding = allowed_shape_finding(&summary.expect("one aggregate summary"));
         let serialized = serde_json::to_string(&finding).expect("serialize finding");
         assert!(serialized.contains("openai"));
         assert!(serialized.contains("github"));
@@ -7518,7 +7533,6 @@ mod tests {
                 "finding leaked a matched value"
             );
         }
-        assert!(guard.finish().is_ok(), "shape observations remain allowed");
     }
 
     #[tokio::test]
