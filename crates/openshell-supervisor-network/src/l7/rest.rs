@@ -801,6 +801,15 @@ fn ensure_streaming_credential_generation(
     Ok(())
 }
 
+async fn write_streamed_body<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    credential_generation: Option<CredentialGenerationGuard<'_>>,
+) -> Result<()> {
+    ensure_streaming_credential_generation(credential_generation)?;
+    writer.write_all(bytes).await.into_diagnostic()
+}
+
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
     req: &L7Request,
     client: &mut C,
@@ -1298,17 +1307,14 @@ where
         miette!("request body credential guard cannot initialize without an active resolver")
     })?;
     ensure_streaming_credential_generation(credential_generation)?;
-    upstream.write_all(headers).await.into_diagnostic()?;
+    write_streamed_body(upstream, headers, credential_generation).await?;
     match req.body_length {
         BodyLength::None => {
             let mut scanner = ReservedMarkerStreamGuard::new(resolver);
             let safe = scanner.push(already_read)?;
             ensure_streaming_credential_generation(credential_generation)?;
-            upstream.write_all(&safe).await.into_diagnostic()?;
-            upstream
-                .write_all(&scanner.finish()?)
-                .await
-                .into_diagnostic()?;
+            write_streamed_body(upstream, &safe, credential_generation).await?;
+            write_streamed_body(upstream, &scanner.finish()?, credential_generation).await?;
         }
         BodyLength::ContentLength(len) => {
             let initial_len = usize::try_from(len)
@@ -1317,7 +1323,7 @@ where
             let mut scanner = ReservedMarkerStreamGuard::new(resolver);
             let safe = scanner.push(&already_read[..initial_len])?;
             ensure_streaming_credential_generation(credential_generation)?;
-            upstream.write_all(&safe).await.into_diagnostic()?;
+            write_streamed_body(upstream, &safe, credential_generation).await?;
             let mut remaining = len.saturating_sub(initial_len as u64);
             let mut buf = vec![0u8; RELAY_BUF_SIZE];
             while remaining > 0 {
@@ -1335,13 +1341,10 @@ where
                 }
                 let safe = scanner.push(&buf[..n])?;
                 ensure_streaming_credential_generation(credential_generation)?;
-                upstream.write_all(&safe).await.into_diagnostic()?;
+                write_streamed_body(upstream, &safe, credential_generation).await?;
                 remaining -= n as u64;
             }
-            upstream
-                .write_all(&scanner.finish()?)
-                .await
-                .into_diagnostic()?;
+            write_streamed_body(upstream, &scanner.finish()?, credential_generation).await?;
         }
         BodyLength::Chunked => {
             relay_chunked_with_marker_guard(
@@ -1358,16 +1361,22 @@ where
     Ok(())
 }
 
-async fn write_chunk<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<()> {
+async fn write_chunk<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+    credential_generation: Option<CredentialGenerationGuard<'_>>,
+) -> Result<()> {
     if payload.is_empty() {
         return Ok(());
     }
-    writer
-        .write_all(format!("{:X}\r\n", payload.len()).as_bytes())
-        .await
-        .into_diagnostic()?;
-    writer.write_all(payload).await.into_diagnostic()?;
-    writer.write_all(b"\r\n").await.into_diagnostic()?;
+    write_streamed_body(
+        writer,
+        format!("{:X}\r\n", payload.len()).as_bytes(),
+        credential_generation,
+    )
+    .await?;
+    write_streamed_body(writer, payload, credential_generation).await?;
+    write_streamed_body(writer, b"\r\n", credential_generation).await?;
     Ok(())
 }
 
@@ -1406,8 +1415,8 @@ where
             .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
 
         if chunk_size == 0 {
-            write_chunk(upstream, &scanner.finish()?).await?;
-            upstream.write_all(b"0\r\n").await.into_diagnostic()?;
+            write_chunk(upstream, &scanner.finish()?, credential_generation).await?;
+            write_streamed_body(upstream, b"0\r\n", credential_generation).await?;
             loop {
                 let trailer =
                     read_chunked_line(client, already_read, &mut read_state, generation_guard)
@@ -1418,8 +1427,8 @@ where
                         "request body credential placeholder denied because rewrite is disabled"
                     ));
                 }
-                upstream.write_all(&trailer).await.into_diagnostic()?;
-                upstream.write_all(b"\r\n").await.into_diagnostic()?;
+                write_streamed_body(upstream, &trailer, credential_generation).await?;
+                write_streamed_body(upstream, b"\r\n", credential_generation).await?;
                 if trailer.is_empty() {
                     return Ok(());
                 }
@@ -1440,7 +1449,7 @@ where
             )
             .await
             .map_err(CollectChunkedError::into_report)?;
-            write_chunk(upstream, &scanner.push(&block)?).await?;
+            write_chunk(upstream, &scanner.push(&block)?, credential_generation).await?;
             remaining -= block_len;
         }
 
