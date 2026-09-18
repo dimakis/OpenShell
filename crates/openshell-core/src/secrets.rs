@@ -175,6 +175,69 @@ impl fmt::Debug for SecretResolver {
 }
 
 impl SecretResolver {
+    /// Returns whether `value` contains a placeholder that this resolver can
+    /// currently redeem. This intentionally differs from
+    /// [`contains_reserved_credential_marker`]: the latter is a syntax check
+    /// used by rewrite paths, while this method is for streamed DLP guards
+    /// where documentation and inactive examples must remain forwardable.
+    ///
+    /// The check accepts the same canonical, revisioned, stable-handle, and
+    /// provider-alias representations as `resolve_placeholder`, including a
+    /// supported percent-encoded wire representation. It never returns or
+    /// logs the matched token or secret.
+    pub fn contains_active_placeholder(&self, value: &str) -> bool {
+        self.contains_active_placeholder_raw(value) || {
+            let decoded = percent_decode(value);
+            decoded != value && self.contains_active_placeholder_raw(&decoded)
+        }
+    }
+
+    /// Number of wire bytes a streaming scanner must retain. Percent encoding
+    /// can expand every byte threefold; retaining the longest active token
+    /// keeps a split encoded identity from being forwarded before detection.
+    #[must_use]
+    pub fn active_placeholder_scan_tail_bytes(&self) -> usize {
+        let known = self
+            .by_placeholder
+            .keys()
+            .map(|placeholder| placeholder.len().saturating_mul(3))
+            .max()
+            .unwrap_or_default();
+        // Revision fallback can redeem a token whose revision is not present
+        // in `by_placeholder`; reserve space for the largest u64 revision.
+        let fallback = self
+            .by_placeholder
+            .keys()
+            .filter_map(|placeholder| placeholder_env_key(placeholder))
+            .map(|key| (PLACEHOLDER_PREFIX.len() + 1 + 20 + 1 + key.len()) * 3)
+            .max()
+            .unwrap_or_default();
+        known.max(fallback)
+    }
+
+    fn contains_active_placeholder_raw(&self, value: &str) -> bool {
+        let mut search_from = 0;
+        while search_from < value.len() {
+            let remainder = &value[search_from..];
+            let canonical = remainder
+                .find(PLACEHOLDER_PREFIX)
+                .map(|offset| search_from + offset);
+            let alias = remainder
+                .find(PROVIDER_ALIAS_MARKER)
+                .map(|offset| alias_start_for_marker(value, search_from + offset));
+            let Some(start) = [canonical, alias].into_iter().flatten().min() else {
+                return false;
+            };
+            if let Some((_, token)) = self.credential_token_at(value, start)
+                && self.resolve_placeholder(token).is_some()
+            {
+                return true;
+            }
+            search_from = start.saturating_add(1);
+        }
+        false
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_provider_env(
         provider_env: HashMap<String, String>,
@@ -1397,6 +1460,53 @@ pub fn redact_target_for_policy(target: &str) -> Result<String, UnresolvedPlaceh
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_placeholder_scan_distinguishes_redeemable_identities_from_examples() {
+        let (_, resolver) = SecretResolver::from_provider_env_for_revision(
+            [(
+                "OPENAI_API_KEY".to_string(),
+                "synthetic-test-secret".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            HashMap::new(),
+            7,
+        );
+        let resolver = resolver.expect("resolver");
+
+        assert!(!resolver.contains_active_placeholder(
+            "docs: openshell:resolve:env:EXAMPLE_KEY and sk-proj-not-a-real-key"
+        ));
+        assert!(!resolver.contains_active_placeholder(
+            "ghp_abcdefghijklmnopqrstuvwxyz1234567890 JWT eyJhbGciOiJIUzI1NiJ9.abc.def AKIAIOSFODNN7EXAMPLE"
+        ));
+        assert!(!resolver.contains_active_placeholder("openshell:resolve:env:v6_OPENAI_API_KEY"));
+        assert!(resolver.contains_active_placeholder("openshell:resolve:env:v7_OPENAI_API_KEY"));
+        assert!(
+            resolver.contains_active_placeholder("openshell%3Aresolve%3Aenv%3Av7_OPENAI_API_KEY")
+        );
+
+        let mut stable_handles = HashMap::new();
+        stable_handles.insert("OPENAI_API_KEY".to_string(), "a".repeat(64));
+        let (_, _, current) =
+            SecretResolver::from_provider_env_for_current_revision_with_stable_handles(
+                [(
+                    "OPENAI_API_KEY".to_string(),
+                    "synthetic-test-secret".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                HashMap::new(),
+                8,
+                &stable_handles,
+            );
+        let current = current.expect("current resolver");
+        assert!(current.contains_active_placeholder(
+            "openshell:resolve:env:saaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_OPENAI_API_KEY"
+        ));
+        assert!(current.contains_active_placeholder("vendor-OPENSHELL-RESOLVE-ENV-OPENAI_API_KEY"));
+    }
 
     // === Existing tests (preserved) ===
 

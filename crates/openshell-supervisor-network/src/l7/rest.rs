@@ -14,12 +14,12 @@ use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, header_mutation};
 use openshell_core::secrets::{
-    CREDENTIAL_MARKER_SCAN_TAIL_BYTES, SecretResolver, contains_reserved_credential_marker,
-    contains_reserved_credential_marker_bytes, rewrite_http_header_block,
+    SecretResolver, contains_reserved_credential_marker, contains_reserved_credential_marker_bytes,
+    rewrite_http_header_block,
 };
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
@@ -1097,6 +1097,7 @@ where
             upstream,
             &rewrite_result.rewritten,
             &req.raw_header[header_end..],
+            options.resolver,
             options.generation_guard,
         )
         .await
@@ -1158,15 +1159,30 @@ where
     Ok(outcome)
 }
 
-#[derive(Default)]
-struct ReservedMarkerStreamGuard {
+struct ReservedMarkerStreamGuard<'a> {
+    resolver: &'a SecretResolver,
     pending: Vec<u8>,
+    shape_tail: Vec<u8>,
+    shape_families: BTreeSet<&'static str>,
 }
 
-impl ReservedMarkerStreamGuard {
+impl<'a> ReservedMarkerStreamGuard<'a> {
+    fn new(resolver: &'a SecretResolver) -> Self {
+        Self {
+            resolver,
+            pending: Vec::new(),
+            shape_tail: Vec::new(),
+            shape_families: BTreeSet::new(),
+        }
+    }
+
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.observe_credential_shapes(bytes);
         self.pending.extend_from_slice(bytes);
-        if contains_reserved_credential_marker_bytes(&self.pending) {
+        if self
+            .resolver
+            .contains_active_placeholder(&String::from_utf8_lossy(&self.pending))
+        {
             return Err(miette!(
                 "request body credential placeholder denied because rewrite is disabled"
             ));
@@ -1174,17 +1190,75 @@ impl ReservedMarkerStreamGuard {
         let safe_len = self
             .pending
             .len()
-            .saturating_sub(CREDENTIAL_MARKER_SCAN_TAIL_BYTES);
+            .saturating_sub(self.resolver.active_placeholder_scan_tail_bytes());
         Ok(self.pending.drain(..safe_len).collect())
     }
 
     fn finish(mut self) -> Result<Vec<u8>> {
-        if contains_reserved_credential_marker_bytes(&self.pending) {
+        if self
+            .resolver
+            .contains_active_placeholder(&String::from_utf8_lossy(&self.pending))
+        {
             return Err(miette!(
                 "request body credential placeholder denied because rewrite is disabled"
             ));
         }
+        self.emit_allowed_shape_finding();
         Ok(std::mem::take(&mut self.pending))
+    }
+
+    fn observe_credential_shapes(&mut self, bytes: &[u8]) {
+        let mut window = std::mem::take(&mut self.shape_tail);
+        window.extend_from_slice(bytes);
+        let text = String::from_utf8_lossy(&window);
+        if text.contains("sk-") {
+            self.shape_families.insert("openai");
+        }
+        if text.contains("ghp_") || text.contains("github_pat_") {
+            self.shape_families.insert("github");
+        }
+        if text.contains("AKIA") || text.contains("ASIA") {
+            self.shape_families.insert("aws");
+        }
+        if text.contains("eyJ") && text.matches('.').count() >= 2 {
+            self.shape_families.insert("jwt");
+        }
+        let keep = window.len().min(256);
+        self.shape_tail
+            .extend_from_slice(&window[window.len() - keep..]);
+    }
+
+    fn allowed_shape_finding(&self) -> Option<openshell_ocsf::OcsfEvent> {
+        (!self.shape_families.is_empty()).then(|| {
+            let families = self
+                .shape_families
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .join(",");
+            let count = self.shape_families.len().to_string();
+            openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Low)
+                .finding_info(openshell_ocsf::FindingInfo::new(
+                    "openshell.credentials.shape_observed",
+                    "Credential-shaped request content observed",
+                ))
+                .evidence_pairs(&[
+                    ("families", families.as_str()),
+                    ("count", count.as_str()),
+                    ("confidence", "low"),
+                    ("location", "request_body"),
+                    ("disposition", "allowed"),
+                ])
+                .message("Credential-shaped request content allowed")
+                .build()
+        })
+    }
+
+    fn emit_allowed_shape_finding(&self) {
+        if let Some(event) = self.allowed_shape_finding() {
+            openshell_ocsf::ocsf_emit!(event);
+        }
     }
 }
 
@@ -1194,16 +1268,20 @@ async fn relay_request_body_with_marker_guard<C, U>(
     upstream: &mut U,
     headers: &[u8],
     already_read: &[u8],
+    resolver: Option<&SecretResolver>,
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<()>
 where
     C: AsyncRead + Unpin,
     U: AsyncWrite + Unpin,
 {
+    let resolver = resolver.ok_or_else(|| {
+        miette!("request body credential guard cannot initialize without an active resolver")
+    })?;
     upstream.write_all(headers).await.into_diagnostic()?;
     match req.body_length {
         BodyLength::None => {
-            let mut scanner = ReservedMarkerStreamGuard::default();
+            let mut scanner = ReservedMarkerStreamGuard::new(resolver);
             let safe = scanner.push(already_read)?;
             upstream.write_all(&safe).await.into_diagnostic()?;
             upstream
@@ -1215,7 +1293,7 @@ where
             let initial_len = usize::try_from(len)
                 .unwrap_or(usize::MAX)
                 .min(already_read.len());
-            let mut scanner = ReservedMarkerStreamGuard::default();
+            let mut scanner = ReservedMarkerStreamGuard::new(resolver);
             let safe = scanner.push(&already_read[..initial_len])?;
             upstream.write_all(&safe).await.into_diagnostic()?;
             let mut remaining = len.saturating_sub(initial_len as u64);
@@ -1243,8 +1321,14 @@ where
                 .into_diagnostic()?;
         }
         BodyLength::Chunked => {
-            relay_chunked_with_marker_guard(client, upstream, already_read, generation_guard)
-                .await?;
+            relay_chunked_with_marker_guard(
+                client,
+                upstream,
+                already_read,
+                resolver,
+                generation_guard,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1267,6 +1351,7 @@ async fn relay_chunked_with_marker_guard<C, U>(
     client: &mut C,
     upstream: &mut U,
     already_read: &[u8],
+    resolver: &SecretResolver,
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<()>
 where
@@ -1278,7 +1363,7 @@ where
         wire_bytes: 0,
         max_wire_bytes: None,
     };
-    let mut scanner = ReservedMarkerStreamGuard::default();
+    let mut scanner = ReservedMarkerStreamGuard::new(resolver);
 
     loop {
         let size_line = read_chunked_line(client, already_read, &mut read_state, generation_guard)
@@ -1302,7 +1387,7 @@ where
                     read_chunked_line(client, already_read, &mut read_state, generation_guard)
                         .await
                         .map_err(CollectChunkedError::into_report)?;
-                if contains_reserved_credential_marker_bytes(&trailer) {
+                if resolver.contains_active_placeholder(&String::from_utf8_lossy(&trailer)) {
                     return Err(miette!(
                         "request body credential placeholder denied because rewrite is disabled"
                     ));
@@ -7212,8 +7297,19 @@ mod tests {
     }
 
     #[test]
-    fn streamed_body_guard_detects_marker_split_across_reads() {
-        let mut guard = ReservedMarkerStreamGuard::default();
+    fn streamed_body_guard_allows_documentation_but_denies_active_identity_split_across_reads() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let mut guard = ReservedMarkerStreamGuard::new(&resolver);
+        assert!(
+            guard
+                .push(b"documentation: openshell:resolve:env:EXAMPLE_KEY")
+                .is_ok()
+        );
         assert!(guard.push(b"prefix-openshell:res").is_ok());
         let error = guard
             .push(b"olve:env:API_TOKEN-suffix")
@@ -7227,19 +7323,16 @@ mod tests {
     /// before the match completes, and the remainder decodes to a non-marker.
     #[test]
     fn streamed_body_guard_detects_fully_encoded_marker_completed_by_one_byte() {
-        const ENCODED: &str = "%6F%70%65%6E%73%68%65%6C%6C%3A%72%65%73%6F%6C%76%65%3A%65%6E%76%3A";
-        assert!(
-            contains_reserved_credential_marker(ENCODED),
-            "fixture must be a recognized marker form"
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
         );
-        assert_eq!(
-            ENCODED.len(),
-            3 * openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC.len(),
-            "fixture must stay the fully encoded form of the current marker"
-        );
-        let (head, tail) = ENCODED.as_bytes().split_at(ENCODED.len() - 1);
+        let resolver = resolver.expect("resolver");
+        let encoded = "openshell%3Aresolve%3Aenv%3AAPI_TOKEN";
+        let (head, tail) = encoded.as_bytes().split_at(encoded.len() - 1);
 
-        let mut guard = ReservedMarkerStreamGuard::default();
+        let mut guard = ReservedMarkerStreamGuard::new(&resolver);
         let forwarded = guard.push(head).expect("partial marker is not a match");
         let error = guard
             .push(tail)
@@ -7250,6 +7343,46 @@ mod tests {
             forwarded.is_empty(),
             "no marker byte may be forwarded early"
         );
+    }
+
+    #[test]
+    fn streamed_body_guard_observes_credential_shapes_across_boundaries_without_blocking() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let mut guard = ReservedMarkerStreamGuard::new(&resolver);
+        assert!(guard.push(b"examples sk-").is_ok());
+        assert!(guard.push(b"proj-inert ghp_fixture AK").is_ok());
+        assert!(
+            guard
+                .push(b"IAINERT eyJhbGciOiJIUzI1NiJ9.payload.signature")
+                .is_ok()
+        );
+
+        let finding = guard
+            .allowed_shape_finding()
+            .expect("one aggregate finding");
+        let serialized = serde_json::to_string(&finding).expect("serialize finding");
+        assert!(serialized.contains("openai"));
+        assert!(serialized.contains("github"));
+        assert!(serialized.contains("aws"));
+        assert!(serialized.contains("jwt"));
+        assert!(serialized.contains("\"count\":\"4\""));
+        for forbidden in [
+            "sk-proj-inert",
+            "ghp_fixture",
+            "AKIAINERT",
+            "eyJhbGciOiJIUzI1NiJ9",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "finding leaked a matched value"
+            );
+        }
+        assert!(guard.finish().is_ok(), "shape observations remain allowed");
     }
 
     #[tokio::test]
@@ -7273,12 +7406,18 @@ mod tests {
         client_side.write_all(&body[split..]).await.unwrap();
         drop(client_side);
         let (mut proxy_upstream, mut upstream_side) = tokio::io::duplex(4096);
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
 
         let error = relay_http_request_with_options_guarded(
             &req,
             &mut proxy_client,
             &mut proxy_upstream,
             RelayRequestOptions {
+                resolver: resolver.as_ref(),
                 deny_uninspected_credentials: true,
                 host: "api.example.com",
                 port: 443,
@@ -7297,12 +7436,18 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_chunked_body_detects_encoded_placeholder() {
-        let wire = b"8\r\nprefix-o\r\n1D\r\npenshell%3Aresolve%3Aenv%3AKEY\r\n0\r\n\r\n";
+        let wire = b"8\r\nprefix-o\r\n1E\r\npenshell%3Aresolve%3Aenv%3AKEY\r\n0\r\n\r\n";
         let (mut upstream_writer, mut upstream_reader) = tokio::io::duplex(4096);
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
         let error = relay_chunked_with_marker_guard(
             &mut tokio::io::empty(),
             &mut upstream_writer,
             wire,
+            resolver.as_ref().expect("resolver"),
             None,
         )
         .await
