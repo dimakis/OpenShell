@@ -3754,6 +3754,33 @@ mod tests {
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
     const TEXT_OPCODE: u8 = 0x1;
 
+    struct RotatingWriter {
+        bytes: Vec<u8>,
+        state: openshell_core::provider_credentials::ProviderCredentialState,
+        rotated: bool,
+    }
+
+    impl AsyncWrite for RotatingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(buf);
+            if !self.rotated {
+                self.rotated = true;
+                self.state.revoke_static_provider_environment(2);
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     struct CountingReader {
         bytes: Vec<u8>,
         position: usize,
@@ -6840,26 +6867,75 @@ mod tests {
         );
     }
 
-    #[test]
-    fn streaming_credential_generation_aborts_fixed_and_chunked_before_next_write() {
+    #[tokio::test]
+    async fn streaming_credential_generation_aborts_actual_fixed_and_chunked_writes() {
         let state =
             openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
                 1,
                 HashMap::new(),
             );
-        let guard = CredentialGenerationGuard::new(&state, 1);
-        // This models rotation after a previous body block was written. Both
-        // framing loops call this shared seam immediately before their next
-        // scanner/write boundary.
-        state.revoke_static_provider_environment(2);
-        for framing in ["content-length", "chunked"] {
-            let error = ensure_streaming_credential_generation(Some(guard))
-                .expect_err("rotation must abort before the next upstream write");
-            assert!(
-                error.to_string().contains("credential generation changed"),
-                "{framing}"
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "synthetic-test-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/".to_string(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: BodyLength::ContentLength(4),
+        };
+        let mut reader = tokio::io::empty();
+        let mut writer = RotatingWriter {
+            bytes: Vec::new(),
+            state: state.clone(),
+            rotated: false,
+        };
+        let error = relay_request_body_with_marker_guard(
+            &req,
+            &mut reader,
+            &mut writer,
+            b"H",
+            b"body",
+            Some(&resolver),
+            Some(CredentialGenerationGuard::new(&state, 1)),
+            None,
+        )
+        .await
+        .expect_err("fixed relay must stop after rotation");
+        assert!(error.to_string().contains("credential generation changed"));
+        assert_eq!(writer.bytes, b"H");
+
+        let state =
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                1,
+                HashMap::new(),
             );
-        }
+        let mut writer = RotatingWriter {
+            bytes: Vec::new(),
+            state: state.clone(),
+            rotated: false,
+        };
+        let wire = b"2001\r\n"
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(b'x', RELAY_BUF_SIZE + 1))
+            .chain(b"\r\n0\r\n\r\n".iter().copied())
+            .collect::<Vec<_>>();
+        let error = relay_chunked_with_marker_guard(
+            &mut tokio::io::empty(),
+            &mut writer,
+            &wire,
+            &resolver,
+            Some(CredentialGenerationGuard::new(&state, 1)),
+            None,
+        )
+        .await
+        .expect_err("chunked relay must stop after rotation");
+        assert!(error.to_string().contains("credential generation changed"));
+        assert!(!writer.bytes.windows(1).any(|b| b == b"x"));
     }
 
     #[test]
