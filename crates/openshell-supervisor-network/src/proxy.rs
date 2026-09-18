@@ -6045,6 +6045,18 @@ async fn handle_forward_proxy(
                 crate::l7::relay::reject_credential_resolution(client, &l7_ctx, error).await?;
                 return Ok(());
             }
+            if crate::l7::relay::handle_streamed_body_credential_placeholder_denial(
+                &report, client, &l7_ctx,
+            )
+            .await?
+            {
+                if let Some(session) = middleware_session.take() {
+                    session
+                        .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                        .await;
+                }
+                return Ok(());
+            }
             Err(report)
         }
         outcome => outcome,

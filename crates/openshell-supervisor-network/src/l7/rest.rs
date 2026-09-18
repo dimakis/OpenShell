@@ -1428,7 +1428,7 @@ where
             .map(str::trim)
             .unwrap_or_default();
         let chunk_size = usize::from_str_radix(size_token, 16)
-            .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
+            .map_err(|_| miette!("Invalid chunk size framing"))?;
 
         if chunk_size == 0 {
             let (tail, summary) = scanner.finish()?;
@@ -1985,9 +1985,8 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
             .next()
             .map(str::trim)
             .unwrap_or_default();
-        let chunk_size = usize::from_str_radix(size_token, 16).map_err(|_| {
-            CollectChunkedError::Failed(miette!("Invalid chunk size token: {size_token:?}"))
-        })?;
+        let chunk_size = usize::from_str_radix(size_token, 16)
+            .map_err(|_| CollectChunkedError::Failed(miette!("Invalid chunk size framing")))?;
 
         if chunk_size == 0 {
             let trailer_line =
@@ -3139,7 +3138,7 @@ where
             .unwrap_or_default();
         let chunk_size = usize::from_str_radix(size_token, 16)
             .into_diagnostic()
-            .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
+            .map_err(|_| miette!("Invalid chunk size framing"))?;
         pos = size_line_end + 2;
 
         if chunk_size == 0 {
@@ -5061,7 +5060,7 @@ mod tests {
                 .expect_err("invalid chunk framing must surface as an error");
 
         assert!(
-            err.to_string().contains("Invalid chunk size token"),
+            err.to_string().contains("Invalid chunk size framing"),
             "unexpected error: {err}"
         );
         assert!(

@@ -303,11 +303,9 @@ where
             if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
                 reject_credential_resolution(client, ctx, error).await?;
                 Ok(None)
-            } else if report
-                .downcast_ref::<crate::l7::rest::StreamedBodyCredentialPlaceholderDenied>()
-                .is_some()
+            } else if handle_streamed_body_credential_placeholder_denial(&report, client, ctx)
+                .await?
             {
-                reject_streamed_body_credential_placeholder(client, ctx).await?;
                 Ok(None)
             } else {
                 Err(report)
@@ -319,24 +317,24 @@ where
 /// Return a complete local policy response for a streamed-body identity denial.
 /// The typed error carries no request content; this response and its telemetry
 /// therefore stay independent of the matched placeholder or credential value.
-async fn reject_streamed_body_credential_placeholder<W>(
+pub(crate) async fn handle_streamed_body_credential_placeholder_denial<W>(
+    report: &miette::Report,
     client: &mut W,
     ctx: &L7EvalContext,
-) -> Result<()>
+) -> Result<bool>
 where
     W: AsyncWrite + Unpin,
 {
     const BODY: &str = r#"{"error":"credential_placeholder_denied","message":"OpenShell denied credential-placeholder traffic"}"#;
-    let response = format!(
-        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
-        BODY.len()
-    );
-    client
-        .write_all(response.as_bytes())
-        .await
-        .into_diagnostic()?;
-    client.flush().await.into_diagnostic()?;
-
+    if report
+        .downcast_ref::<crate::l7::rest::StreamedBodyCredentialPlaceholderDenied>()
+        .is_none()
+    {
+        return Ok(false);
+    }
+    // Audit before attempting a client write: a reset client must not erase a
+    // confirmed local policy decision. Both records contain destination-only
+    // context and no body/identity material.
     ocsf_emit!(
         HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Fail)
@@ -353,12 +351,35 @@ where
             ))
             .build()
     );
-    crate::l7::emit_uninspected_credential_finding(
-        &ctx.host,
-        &ctx.policy_name,
-        "http-request-body",
+    ocsf_emit!(
+        DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .finding_info(FindingInfo::new(
+                "openshell.credentials.placeholder_denied",
+                "OpenShell credential-placeholder traffic denied",
+            ))
+            .evidence_pairs(&[
+                ("policy", ctx.policy_name.as_str()),
+                ("host", ctx.host.as_str()),
+                ("surface", "http-request-body"),
+                ("reason", "credential_placeholder_denied"),
+            ])
+            .message("OpenShell denied credential-placeholder traffic")
+            .build()
     );
-    Ok(())
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+        BODY.len()
+    );
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+
+    Ok(true)
 }
 
 #[derive(Default)]
