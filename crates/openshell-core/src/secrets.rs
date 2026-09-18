@@ -830,6 +830,8 @@ fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
     let suffix = key.strip_prefix('v')?;
     let (revision, env_key) = suffix.split_once('_')?;
     if revision.is_empty()
+        || revision.len() > 20
+        || (revision.len() > 1 && revision.starts_with('0'))
         || !revision.bytes().all(|b| b.is_ascii_digit())
         || env_key.is_empty()
         || !env_key.bytes().all(is_env_key_char)

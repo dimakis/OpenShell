@@ -1098,6 +1098,7 @@ where
             &rewrite_result.rewritten,
             &req.raw_header[header_end..],
             options.resolver,
+            options.credential_generation,
             options.generation_guard,
         )
         .await
@@ -1273,6 +1274,7 @@ async fn relay_request_body_with_marker_guard<C, U>(
     headers: &[u8],
     already_read: &[u8],
     resolver: Option<&SecretResolver>,
+    credential_generation: Option<CredentialGenerationGuard<'_>>,
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<()>
 where
@@ -1282,11 +1284,17 @@ where
     let resolver = resolver.ok_or_else(|| {
         miette!("request body credential guard cannot initialize without an active resolver")
     })?;
+    if let Some(guard) = credential_generation {
+        guard.ensure_current()?;
+    }
     upstream.write_all(headers).await.into_diagnostic()?;
     match req.body_length {
         BodyLength::None => {
             let mut scanner = ReservedMarkerStreamGuard::new(resolver);
             let safe = scanner.push(already_read)?;
+            if let Some(guard) = credential_generation {
+                guard.ensure_current()?;
+            }
             upstream.write_all(&safe).await.into_diagnostic()?;
             upstream
                 .write_all(&scanner.finish()?)
@@ -1299,6 +1307,9 @@ where
                 .min(already_read.len());
             let mut scanner = ReservedMarkerStreamGuard::new(resolver);
             let safe = scanner.push(&already_read[..initial_len])?;
+            if let Some(guard) = credential_generation {
+                guard.ensure_current()?;
+            }
             upstream.write_all(&safe).await.into_diagnostic()?;
             let mut remaining = len.saturating_sub(initial_len as u64);
             let mut buf = vec![0u8; RELAY_BUF_SIZE];
@@ -1316,6 +1327,9 @@ where
                     guard.ensure_current()?;
                 }
                 let safe = scanner.push(&buf[..n])?;
+                if let Some(guard) = credential_generation {
+                    guard.ensure_current()?;
+                }
                 upstream.write_all(&safe).await.into_diagnostic()?;
                 remaining -= n as u64;
             }
@@ -1330,6 +1344,7 @@ where
                 upstream,
                 already_read,
                 resolver,
+                credential_generation,
                 generation_guard,
             )
             .await?;
@@ -1356,6 +1371,7 @@ async fn relay_chunked_with_marker_guard<C, U>(
     upstream: &mut U,
     already_read: &[u8],
     resolver: &SecretResolver,
+    credential_generation: Option<CredentialGenerationGuard<'_>>,
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<()>
 where
@@ -1370,6 +1386,9 @@ where
     let mut scanner = ReservedMarkerStreamGuard::new(resolver);
 
     loop {
+        if let Some(guard) = credential_generation {
+            guard.ensure_current()?;
+        }
         let size_line = read_chunked_line(client, already_read, &mut read_state, generation_guard)
             .await
             .map_err(CollectChunkedError::into_report)?;
@@ -7455,6 +7474,7 @@ mod tests {
             &mut upstream_writer,
             wire,
             resolver.as_ref().expect("resolver"),
+            None,
             None,
         )
         .await
