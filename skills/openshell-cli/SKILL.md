@@ -23,6 +23,10 @@ openshell <group> <cmd> --help      # Flags for a specific command
 
 This is your primary fallback. Use it freely -- the CLI's help output is authoritative and always up-to-date.
 
+For controller-driven credential rotation, check `openshell provider update --help`
+for `--expected-resource-version`. Use the version from the intended provider read
+and handle a conflict explicitly; do not silently retry against a newer version.
+
 ## Prerequisites
 
 - `openshell` is on the PATH. Follow the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md) when it is not installed.
