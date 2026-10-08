@@ -2202,6 +2202,7 @@ fn print_provider_type_row(
 }
 
 pub struct ProviderUpdateOptions<'a> {
+    pub expected_resource_version: Option<u64>,
     pub server: &'a str,
     pub name: &'a str,
     pub from_existing: bool,
@@ -2215,6 +2216,7 @@ pub struct ProviderUpdateOptions<'a> {
 
 pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     let ProviderUpdateOptions {
+        expected_resource_version,
         server,
         name,
         from_existing,
@@ -2225,6 +2227,10 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
         workspace,
         tls,
     } = options;
+
+    if expected_resource_version == Some(0) {
+        return Err(miette::miette!("expected resource version must be nonzero"));
+    }
 
     if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
@@ -2316,7 +2322,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                     name: name.to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
-                    resource_version: 0,
+                    resource_version: expected_resource_version.unwrap_or(0),
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
                     deletion_timestamp_ms: 0,

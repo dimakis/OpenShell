@@ -178,6 +178,19 @@ Update a provider's credentials:
 openshell provider update my-claude --from-existing
 ```
 
+For a controller that previously read a provider version, condition the write on
+that exact version to avoid overwriting a concurrent change:
+
+```shell
+openshell provider update my-claude \
+  --expected-resource-version 41 --credential ANTHROPIC_API_KEY
+```
+
+The credential value comes from the named environment variable. A stale version
+fails without updating the provider. Versions must be positive; omitting the flag
+retains the existing update behavior. Do not automatically retry a conflict with
+a newly read version unless the replacement is still explicitly intended.
+
 Set or clear a credential expiry timestamp:
 
 ```shell

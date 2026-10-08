@@ -663,6 +663,17 @@ impl OpenShell for TestOpenShell {
             .get(provider.object_name())
             .cloned()
             .ok_or_else(|| Status::not_found("provider not found"))?;
+        let expected = provider
+            .metadata
+            .as_ref()
+            .map_or(0, |meta| meta.resource_version);
+        let current = existing
+            .metadata
+            .as_ref()
+            .map_or(0, |meta| meta.resource_version);
+        if expected != 0 && expected != current {
+            return Err(Status::aborted("provider version conflict"));
+        }
         // Merge semantics: empty map = no change, empty value = delete key.
         let merge = |mut base: HashMap<String, String>,
                      incoming: HashMap<String, String>|
@@ -700,7 +711,7 @@ impl OpenShell for TestOpenShell {
                 name: provider_metadata.name,
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
-                resource_version: 0,
+                resource_version: current + 1,
                 annotations: HashMap::new(),
                 workspace: String::new(),
                 deletion_timestamp_ms: 0,
@@ -1239,6 +1250,78 @@ async fn install_test_profile(ts: &TestServer, id: &str, credential_key: &str) {
 /// from the request workspace. The gateway treats it as immutable, so deriving
 /// it here would look like a change and be rejected.
 #[tokio::test]
+async fn provider_update_conditions_write_on_the_supplied_version() {
+    let ts = run_server().await;
+    run::provider_create(
+        &ts.endpoint,
+        "work-api",
+        "claude",
+        false,
+        &["API_KEY=old".to_string()],
+        false,
+        &[],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("create synthetic provider");
+    ts.state
+        .providers
+        .lock()
+        .await
+        .get_mut("work-api")
+        .unwrap()
+        .metadata
+        .as_mut()
+        .unwrap()
+        .resource_version = 41;
+    let credentials = ["API_KEY=rotated".to_string()];
+    let update = |expected_resource_version| run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "work-api",
+        from_existing: false,
+        from_oidc_token: false,
+        credentials: &credentials,
+        config: &[],
+        credential_expires_at: &[],
+        expected_resource_version,
+        workspace: "default",
+        tls: &ts.tls,
+    };
+    run::provider_update(update(Some(41)))
+        .await
+        .expect("matching version");
+    let requests = ts.state.provider_update_requests.lock().await;
+    assert_eq!(
+        requests
+            .last()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .resource_version,
+        41
+    );
+    drop(requests);
+    let before = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("work-api")
+        .cloned()
+        .unwrap();
+    assert!(
+        run::provider_update(update(Some(41))).await.is_err(),
+        "stale version must be rejected by gateway CAS"
+    );
+    assert_eq!(
+        ts.state.providers.lock().await.get("work-api"),
+        Some(&before)
+    );
+}
+
+#[tokio::test]
 async fn provider_update_preserves_stored_type_and_profile_workspace_when_readable() {
     let ts = run_server().await;
 
@@ -1257,6 +1340,7 @@ async fn provider_update_preserves_stored_type_and_profile_workspace_when_readab
     .expect("provider create");
 
     run::provider_update(run::ProviderUpdateOptions {
+        expected_resource_version: None,
         server: &ts.endpoint,
         name: "my-claude",
         from_existing: false,
@@ -1378,6 +1462,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     ts.state.deny_provider_reads.store(true, Ordering::SeqCst);
 
     run::provider_update(run::ProviderUpdateOptions {
+        expected_resource_version: None,
         server: &ts.endpoint,
         name: "my-claude",
         from_existing: false,
@@ -2346,6 +2431,7 @@ async fn provider_update_from_existing_uses_profile_discovery() {
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
     run::provider_update(run::ProviderUpdateOptions {
+        expected_resource_version: None,
         server: &ts.endpoint,
         name: "custom-update",
         from_existing: true,
@@ -2418,6 +2504,7 @@ async fn provider_update_from_existing_preserves_global_profile_scope() {
     ]);
 
     run::provider_update(run::ProviderUpdateOptions {
+        expected_resource_version: None,
         server: &ts.endpoint,
         name: "global-update",
         from_existing: true,
@@ -2495,6 +2582,7 @@ async fn provider_update_from_oidc_token_preserves_global_profile_scope() {
     );
 
     let err = run::provider_update(run::ProviderUpdateOptions {
+        expected_resource_version: None,
         server: &ts.endpoint,
         name: "global-oidc-update",
         from_existing: false,

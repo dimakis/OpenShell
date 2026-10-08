@@ -306,6 +306,11 @@ Domain objects use shared metadata: stable server-generated IDs, human-readable
 names, creation timestamps, and labels. Crate-level details live in
 `crates/openshell-core/README.md`.
 
+Provider updates can carry a nonzero resource version in object metadata. The
+gateway conditions persistence on that version; a concurrent change rejects the
+write. The CLI exposes this through `provider update --expected-resource-version`
+so controllers can retain their earlier read boundary through credential rotation.
+
 ## Persistence
 
 The gateway persistence layer is a protobuf object store. Domain services store

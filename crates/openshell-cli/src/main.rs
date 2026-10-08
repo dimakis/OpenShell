@@ -917,6 +917,10 @@ enum ProviderCommands {
     /// Update an existing provider's credentials or config.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
+        /// Reject the update unless the provider still has this resource version.
+        #[arg(long, value_name = "VERSION", value_parser = clap::value_parser!(u64).range(1..))]
+        expected_resource_version: Option<u64>,
+
         /// Provider name.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         name: String,
@@ -3727,6 +3731,7 @@ async fn run_async() -> Result<()> {
                     }
                 }
                 ProviderCommands::Update {
+                    expected_resource_version,
                     name,
                     from_existing,
                     from_oidc_token,
@@ -3735,6 +3740,7 @@ async fn run_async() -> Result<()> {
                     credential_expires_at,
                 } => {
                     run::provider_update(run::ProviderUpdateOptions {
+                        expected_resource_version,
                         server: endpoint,
                         name: &name,
                         from_existing,
@@ -5175,6 +5181,43 @@ mod tests {
                 }))
             }) if name == "my-graph" && credential_key == "MS_GRAPH_ACCESS_TOKEN"
         ));
+    }
+
+    #[test]
+    fn provider_update_accepts_nonzero_expected_version() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "update",
+            "work-api",
+            "--expected-resource-version",
+            "41",
+            "--credential",
+            "OPENAI_API_KEY",
+        ])
+        .expect("conditional provider update should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Update {
+                    expected_resource_version: Some(41),
+                    ..
+                })
+            })
+        ));
+        for invalid in ["0", "-1", "invalid"] {
+            assert!(
+                Cli::try_parse_from([
+                    "openshell",
+                    "provider",
+                    "update",
+                    "work-api",
+                    "--expected-resource-version",
+                    invalid
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]
