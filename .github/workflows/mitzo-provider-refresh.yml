@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Mitzo provider refresh regressions
+
+on:
+  push:
+    branches: [fix/warm-provider-refresh]
+
+permissions:
+  contents: read
+
+jobs:
+  provider-refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: "2"
+      OPENSHELL_TELEMETRY_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Verify credential snapshot and notification behavior
+        run: cargo test --locked -p openshell-core --no-default-features provider_credentials::tests -- --test-threads=1
+      - name: Verify policy reconciliation and request-driven wake-up
+        run: cargo test --locked -p openshell-sandbox --lib -- --test-threads=1
+      - name: Verify the real SSH handler with synthetic transports
+        run: cargo test --locked -p openshell-supervisor-process ssh::tests -- --test-threads=1
+      - name: Check the changed Rust crates
+        run: cargo clippy --locked -p openshell-core -p openshell-sandbox -p openshell-supervisor-process --all-targets -- -D warnings

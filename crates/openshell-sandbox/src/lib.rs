@@ -3713,6 +3713,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     // seed the applied-state trackers before OPA actually loads it.
     let mut pending_result = None;
 
+    let mut last_poll_started = tokio::time::Instant::now();
     // Initialize revision from the first poll and acknowledge the initial
     // policy revision the supervisor actually loaded. A mismatched result is
     // reconciled below instead of being recorded as already applied.
@@ -3780,7 +3781,18 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         let result = if let Some(result) = pending_result.take() {
             result
         } else {
-            tokio::time::sleep(next_poll_delay(&ctx.extension_credentials, interval)).await;
+            tokio::select! {
+                () = tokio::time::sleep(next_poll_delay(&ctx.extension_credentials, interval)) => {}
+                () = ctx.provider_credentials.refresh_requested() => {
+                    // Fresh SSH children can need newly attached providers.
+                    // Coalesce bursts and bound request-driven polling without
+                    // increasing the ordinary idle reconciliation rate.
+                    tokio::time::sleep_until(
+                        last_poll_started + Duration::from_millis(250),
+                    ).await;
+                }
+            }
+            last_poll_started = tokio::time::Instant::now();
             match client.poll_settings(&ctx.sandbox_id).await {
                 Ok(result) => {
                     let _ = ctx.workspace_tx.send(client.workspace());
@@ -5063,6 +5075,41 @@ network_policies:
             0,
             "same-hash acknowledgement must not reload OPA"
         );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn child_environment_request_wakes_poll_without_waiting_for_the_periodic_interval() {
+        let mut v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        v1.policy_hash = "same-policy".to_string();
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.config_revision = 200;
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.interval_secs = 60;
+        let credentials = ctx.provider_credentials.clone();
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(v1).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        expect_no_policy_report(&mut reports).await;
+        credentials.request_refresh();
+        expect_policy_report(&mut reports, 2).await;
+        assert_eq!(engine.current_generation(), 0);
         handle.abort();
     }
 

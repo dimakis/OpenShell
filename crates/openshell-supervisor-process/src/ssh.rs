@@ -714,6 +714,10 @@ impl russh::server::Handler for SshHandler {
         if command.is_empty() {
             return Ok(());
         }
+        // Request prompt reconciliation through the existing credential owner.
+        // This is not a readiness receipt: the child still receives only the
+        // currently verified environment, and launchers must gate their needs.
+        self.provider_credentials.request_refresh();
         self.start_shell(channel, session.handle(), Some(command))?;
         Ok(())
     }
@@ -2429,6 +2433,17 @@ mod tests {
     async fn authenticated_test_client_with_main(
         main_session: Arc<MainSession>,
     ) -> russh::client::Handle<AcceptAnyServerKey> {
+        authenticated_test_client_with_credentials(
+            main_session,
+            ProviderCredentialState::from_child_env_snapshot(0, HashMap::new()),
+        )
+        .await
+    }
+
+    async fn authenticated_test_client_with_credentials(
+        main_session: Arc<MainSession>,
+        provider_credentials: ProviderCredentialState,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
         // Scoped so the `!Send` ThreadRng is dropped before the first await.
         let host_key = {
             let mut rng = rand::rng();
@@ -2446,7 +2461,7 @@ mod tests {
             None,
             None,
             None,
-            ProviderCredentialState::from_child_env_snapshot(0, HashMap::new()),
+            provider_credentials,
             HashMap::new(),
             ResolvedProcessIdentity::default(),
             ProcessEnforcementMode::NetworkOnly,
@@ -2484,6 +2499,24 @@ mod tests {
 
     async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
         authenticated_test_client_with_main(MainSession::inert()).await
+    }
+
+    #[tokio::test]
+    async fn authenticated_exec_requests_a_provider_refresh_without_modifying_the_snapshot() {
+        let credentials = ProviderCredentialState::from_child_env_snapshot(7, HashMap::new());
+        let client =
+            authenticated_test_client_with_credentials(MainSession::inert(), credentials.clone())
+                .await;
+        let channel = client.channel_open_session().await.expect("open session");
+        channel
+            .exec(true, "/usr/bin/true")
+            .await
+            .expect("send exec");
+        tokio::time::timeout(Duration::from_secs(1), credentials.refresh_requested())
+            .await
+            .expect("authenticated exec should wake the existing refresh owner");
+        assert_eq!(credentials.snapshot().revision, 7);
+        assert!(credentials.child_env_with_gcp_resolved().is_empty());
     }
 
     #[tokio::test]

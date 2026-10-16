@@ -12,6 +12,7 @@ use crate::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Notify;
 
 const MAX_RETAINED_CREDENTIAL_GENERATIONS: usize = 8;
 
@@ -58,6 +59,7 @@ struct CompiledStaticCredentialEndpointBinding {
 #[derive(Debug, Clone)]
 pub struct ProviderCredentialState {
     inner: Arc<RwLock<ProviderCredentialStateInner>>,
+    refresh_requested: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,18 @@ impl fmt::Display for StaticCredentialBindingError {
 impl std::error::Error for StaticCredentialBindingError {}
 
 impl ProviderCredentialState {
+    /// Wake the existing gateway reconciliation owner before a fresh child.
+    /// This carries no credentials and does not acknowledge provider readiness.
+    pub fn request_refresh(&self) {
+        self.refresh_requested.notify_one();
+    }
+
+    /// A single owner consumes coalesced requests, including requests made
+    /// before it starts waiting. Credential installation remains unchanged.
+    pub async fn refresh_requested(&self) {
+        self.refresh_requested.notified().await;
+    }
+
     pub fn from_environment(
         revision: u64,
         env: HashMap<String, String>,
@@ -96,6 +110,7 @@ impl ProviderCredentialState {
         let combined_resolver = merge_resolvers(&generations, current_resolver.as_ref());
 
         Self {
+            refresh_requested: Arc::new(Notify::new()),
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot,
                 generations,
@@ -148,6 +163,7 @@ impl ProviderCredentialState {
         );
 
         Ok(Self {
+            refresh_requested: Arc::new(Notify::new()),
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot,
                 generations,
@@ -178,6 +194,7 @@ impl ProviderCredentialState {
         });
 
         Self {
+            refresh_requested: Arc::new(Notify::new()),
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot,
                 generations: VecDeque::new(),
@@ -798,6 +815,31 @@ fn merge_resolvers(
 mod tests {
     use super::*;
     use crate::google_cloud;
+
+    #[tokio::test]
+    async fn child_refresh_requests_wake_the_shared_owner_and_coalesce_without_changing_credentials()
+     {
+        let state = ProviderCredentialState::from_child_env_snapshot(7, HashMap::new());
+        let child = state.clone();
+        child.request_refresh();
+        child.request_refresh();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            state.refresh_requested(),
+        )
+        .await
+        .expect("a request before polling must wake the owner");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                state.refresh_requested()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.snapshot().revision, 7);
+        assert!(state.child_env_with_gcp_resolved().is_empty());
+    }
 
     fn binding(host: &str, port: u32, path: &str) -> StaticCredentialBinding {
         StaticCredentialBinding {
