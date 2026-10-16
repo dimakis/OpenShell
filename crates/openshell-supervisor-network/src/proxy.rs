@@ -9602,6 +9602,47 @@ network_policies:
     /// truncation handlers would append an SSE `proxy_stream_error` frame into
     /// the JSON body. This guards the framing classification for the protocol.
     #[tokio::test]
+    async fn inference_standalone_search_returns_one_buffered_json_document() {
+        let router = openshell_router::Router::new().unwrap();
+        let mut route = model_discovery_inference_route("mock://search-fixture".to_string());
+        route.protocols = vec!["openai_standalone_search".to_string()];
+        let ctx = InferenceContext::new(
+            crate::l7::inference::default_patterns(),
+            router,
+            vec![route],
+            vec![],
+        );
+        let body = r#"{"id":"search","model":"search-context-model","commands":{"search_query":[{"q":"OpenShell"}]}}"#;
+        let request = format!(
+            "POST /v1/alpha/search HTTP/1.1\r\nHost: inference.local\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut reader, mut writer) = tokio::io::split(client);
+        let task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+        writer.write_all(request.as_bytes()).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8(response).unwrap();
+        let (headers, body) = text.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200"));
+        assert!(!headers.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains(&format!("content-length: {}", body.len()))
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(body).is_ok());
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            InferenceOutcome::Routed
+        ));
+    }
+
+    #[tokio::test]
     async fn inference_model_discovery_served_buffered_with_content_length() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = listener.local_addr().unwrap();

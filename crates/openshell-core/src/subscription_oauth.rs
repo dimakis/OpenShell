@@ -53,7 +53,8 @@ pub const XAI_GROK_SCOPES: &[&str] = &[
     "grok-cli:access",
 ];
 
-pub const OPENAI_CODEX_INFERENCE_PROTOCOLS: &[&str] = &["openai_responses"];
+pub const OPENAI_CODEX_INFERENCE_PROTOCOLS: &[&str] =
+    &["openai_responses", "openai_standalone_search"];
 pub const XAI_GROK_INFERENCE_PROTOCOLS: &[&str] = &["openai_chat_completions", "model_discovery"];
 pub const OPENAI_CODEX_ROUTE_HEADERS: &[(&str, &str)] = &[("originator", "openshell")];
 pub const XAI_GROK_ROUTE_HEADERS: &[(&str, &str)] = &[];

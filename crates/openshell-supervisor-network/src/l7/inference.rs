@@ -84,6 +84,15 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             kind: "responses".to_string(),
             framing: ResponseFraming::Streaming,
         },
+        // Codex executes standalone web search through its selected provider.
+        // The result is one JSON document, never an SSE inference stream.
+        InferenceApiPattern {
+            method: "POST".to_string(),
+            path_glob: "/v1/alpha/search".to_string(),
+            protocol: "openai_standalone_search".to_string(),
+            kind: "web_search".to_string(),
+            framing: ResponseFraming::Buffered,
+        },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/embeddings".to_string(),
@@ -503,6 +512,23 @@ mod tests {
         let result = detect_inference_pattern("POST", "/v1/chat/completions", &patterns);
         assert!(result.is_some());
         assert_eq!(result.unwrap().protocol, "openai_chat_completions");
+    }
+
+    #[test]
+    fn detect_standalone_search_is_exact_and_buffered() {
+        let patterns = default_patterns();
+        let pattern = detect_inference_pattern("POST", "/v1/alpha/search", &patterns)
+            .expect("standalone search must use the attached inference route");
+        assert_eq!(pattern.protocol, "openai_standalone_search");
+        assert!(pattern.is_buffered());
+        for path in [
+            "/v1/alpha/search/extra",
+            "/v1/alpha/searching",
+            "/admin/search",
+        ] {
+            assert!(detect_inference_pattern("POST", path, &patterns).is_none());
+        }
+        assert!(detect_inference_pattern("GET", "/v1/alpha/search", &patterns).is_none());
     }
 
     #[test]

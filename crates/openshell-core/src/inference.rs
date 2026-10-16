@@ -420,7 +420,10 @@ mod tests {
             codex.default_base_url,
             subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL
         );
-        assert_eq!(codex.protocols, &["openai_responses"]);
+        assert_eq!(
+            codex.protocols,
+            &["openai_responses", "openai_standalone_search"]
+        );
         assert!(codex.base_url_config_keys.is_empty());
         assert!(codex.requires_provider_attachment);
 

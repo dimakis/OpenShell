@@ -92,6 +92,22 @@ OpenAI hosts remain governed by the sandbox's ordinary network policy; the
 subscription grant is usable only through `inference.local` and only while this
 exact provider is attached.
 
+## Standalone web search
+
+The attached subscription route supports Codex Responses requests and the exact
+`POST /v1/alpha/search` standalone-search endpoint. Search is forwarded to the
+pinned Codex backend's `/alpha/search` endpoint with gateway-owned account and
+authorization headers. It returns buffered JSON; it is not a Responses request
+and its body preserves the model identity and settings supplied by Codex search
+context.
+
+A custom Codex provider must declare `supports_standalone_web_search = true`
+when standalone search is enabled. The gateway and supervisor must both include
+this routing support. An older supervisor may reject the search path even while
+normal inference works; repeating the request or allowing the public internet
+in sandbox policy does not repair that route. Report the capability failure and
+have the operator update the matched gateway/supervisor components.
+
 ## Refresh and failure behavior
 
 The gateway refreshes the access token before expiry and binds refreshed tokens

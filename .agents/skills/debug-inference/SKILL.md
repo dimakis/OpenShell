@@ -406,3 +406,14 @@ When you report back, state:
 2. Whether gateway topology is part of the problem
 3. The most likely root cause
 4. The exact fix commands the user should run
+
+## Codex subscription standalone search
+
+When Responses inference works but native search reports no completed receipt,
+check the custom Codex provider's `supports_standalone_web_search` capability and
+the matched supervisor/router support for `POST /v1/alpha/search`. Search has its
+own buffered JSON protocol and cannot use the Responses path/body rewrite.
+A policy denial for this exact path can come from an older inference interceptor;
+a broader sandbox network rule does not fix it. Stop unchanged retries and
+report the required component update. Never use another account, copied OAuth
+tokens, or direct sandbox egress as a fallback.

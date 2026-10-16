@@ -331,6 +331,19 @@ fn prepare_backend_request(
     body: bytes::Bytes,
     stream_response: bool,
 ) -> Result<(reqwest::RequestBuilder, String), RouterError> {
+    let standalone_search = path.split('?').next() == Some("/v1/alpha/search");
+    if standalone_search
+        && (method != "POST"
+            || !route
+                .protocols
+                .iter()
+                .any(|p| p == "openai_standalone_search"))
+    {
+        return Err(RouterError::Unauthorized(
+            "standalone search requires its advertised protocol and POST method".to_string(),
+        ));
+    }
+
     // For AWS Bedrock routes the model id is encoded in the URL path
     // (`/model/{modelId}/invoke[-with-response-stream]`), not in the
     // JSON body. The caller's path can carry any model id; rewrite it
@@ -403,7 +416,13 @@ fn prepare_backend_request(
     //   path) and inject "anthropic_version" (required in the body, not a header).
     // Non-JSON bodies pass through unchanged; model rewrite and version injection
     // are silently skipped. Such bodies would be rejected by the upstream anyway.
-    let body = rewrite_inference_request_body(route, body)?;
+    // Search has its own schema. In particular it is not a Responses request:
+    // preserve the model identity and settings carried by its search context.
+    let body = if standalone_search {
+        body
+    } else {
+        rewrite_inference_request_body(route, body)?
+    };
     builder = builder.body(body);
 
     Ok((builder, url))
@@ -870,6 +889,17 @@ fn build_provider_url(
     stream_response: bool,
 ) -> String {
     let base = route.endpoint.trim_end_matches('/');
+    // The subscription's fixed /responses override must not capture search.
+    // Keep the upstream origin pinned and grant-derived headers/auth unchanged.
+    if is_openai_codex_subscription_route(route)
+        && route
+            .protocols
+            .iter()
+            .any(|p| p == "openai_standalone_search")
+        && protocol_path.split('?').next() == Some("/v1/alpha/search")
+    {
+        return format!("{base}/alpha/search");
+    }
     match (&route.request_path_override, route.model_in_path) {
         // Vertex AI publisher endpoint: model in URL path with suffix
         // e.g. .../publishers/anthropic/models/claude-3-5-sonnet@20241022:rawPredict
@@ -1381,6 +1411,108 @@ mod tests {
         assert_eq!(
             kept,
             vec![("content-type".to_string(), "application/json".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_search_round_trips_buffered_json_without_model_rewrite() {
+        let server = MockServer::start().await;
+        let body =
+            br#"{"id":"search-session","model":"model-id-from-search-context","commands":{"search_query":[{"q":"OpenShell"}]},"settings":{"search_context_size":"low"},"telemetry_attributes":{"model_slug":"test-model"}}"#;
+        let response = serde_json::json!({"results":[{"url":"https://example.com/source"}]});
+        Mock::given(method("POST"))
+            .and(path("/v1/alpha/search"))
+            .and(header("authorization", "Bearer sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let route = test_route(
+            &server.uri(),
+            &["openai_standalone_search"],
+            AuthHeader::Bearer,
+        );
+        let result = proxy_to_backend(
+            &reqwest::Client::new(),
+            &route,
+            "openai_standalone_search",
+            "POST",
+            "/v1/alpha/search",
+            vec![],
+            bytes::Bytes::from_static(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&result.body).unwrap(),
+            response
+        );
+        assert_eq!(server.received_requests().await.unwrap()[0].body, body);
+    }
+
+    #[test]
+    fn standalone_search_rejects_unadvertised_routes_and_wrong_methods() {
+        for (protocols, method) in [
+            (vec!["openai_responses"], "POST"),
+            (vec!["openai_standalone_search"], "GET"),
+        ] {
+            let route = test_route("https://api.openai.com/v1", &protocols, AuthHeader::Bearer);
+            assert!(matches!(
+                prepare_backend_request(
+                    &reqwest::Client::new(),
+                    &route,
+                    method,
+                    "/v1/alpha/search",
+                    &[],
+                    bytes::Bytes::from_static(b"{}"),
+                    false
+                ),
+                Err(RouterError::Unauthorized(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn codex_standalone_search_preserves_body_and_gateway_identity() {
+        let mut route = test_route(
+            openshell_core::subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL,
+            &["openai_responses", "openai_standalone_search"],
+            AuthHeader::Bearer,
+        );
+        route.request_path_override = Some("/responses".to_string());
+        route.default_headers = vec![
+            ("chatgpt-account-id".into(), "bound-account".into()),
+            ("originator".into(), "openshell".into()),
+        ];
+        let body = bytes::Bytes::from_static(
+            br#"{ "id":"search-session", "model":"model-id-from-search-context", "commands":{"search_query":[{"q":"OpenShell"}]}, "settings":{"search_context_size":"low"}, "telemetry_attributes":{"model_slug":"test-model"} }"#,
+        );
+        let headers = vec![
+            ("authorization".into(), "Bearer hostile-token".into()),
+            ("chatgpt-account-id".into(), "hostile-account".into()),
+            ("originator".into(), "hostile-originator".into()),
+        ];
+        let (builder, url) = prepare_backend_request(
+            &reqwest::Client::new(),
+            &route,
+            "POST",
+            "/v1/alpha/search",
+            &headers,
+            body.clone(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/alpha/search");
+        let request = builder.build().unwrap();
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), body.as_ref());
+        assert_eq!(request.headers()["authorization"], "Bearer sk-test");
+        assert_eq!(request.headers()["chatgpt-account-id"], "bound-account");
+        assert_eq!(request.headers()["originator"], "openshell");
+        // Responses retain their existing fixed upstream path.
+        assert_eq!(
+            build_provider_url(&route, &route.model, "/v1/responses", true),
+            "https://chatgpt.com/backend-api/codex/responses"
         );
     }
 

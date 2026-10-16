@@ -784,3 +784,13 @@ system entry instead of pretending to delete package-manager owned state.
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file
   should only record stable architecture.
+
+### Codex subscription standalone search
+
+The attached Codex subscription route advertises Responses and standalone web
+search separately. The supervisor recognises only `POST /v1/alpha/search` for
+search, uses the selected attached route and buffers its JSON response. The
+router maps it to the pinned Codex origin's `/alpha/search`, preserving the
+search body and gateway-owned authorization/account headers. Responses retain
+their `/responses` override and model rewrite. This adds no direct sandbox
+egress or alternate credential route.
