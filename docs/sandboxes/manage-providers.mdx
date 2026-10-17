@@ -303,6 +303,13 @@ for runtime attach and detach behavior.
 
 </Warning>
 
+For runtime attachment in the monolithic supervisor, a new authenticated SSH
+exec request asks the supervisor to refresh provider state promptly. Applications
+still need to check their required environment before initializing a client:
+the attachment response confirms the gateway change, while the supervisor
+validates and installs its local snapshot separately. Process-only sidecars
+retain their existing snapshot delivery path.
+
 ### Auto-Discovery Shortcut
 
 When `providers_v2_enabled=false` and the trailing command in

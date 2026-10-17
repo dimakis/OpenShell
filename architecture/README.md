@@ -151,6 +151,14 @@ supervisor. The supervisor validates and applies what can change at runtime,
 keeps last-known-good config when refresh fails, and leaves static isolation
 controls in place until the sandbox is recreated.
 
+In the monolithic supervisor, authenticated SSH exec requests also wake this
+existing reconciliation owner. Requests coalesce and are limited to one
+request-driven poll per 250 ms; idle polling keeps its existing interval. The
+wake-up carries no credential values and does not acknowledge readiness. New
+children receive only the currently verified snapshot, so applications still
+check their required environment before starting a model or replaying work.
+The process-only sidecar topology retains its existing snapshot delivery path.
+
 Live operations use the same authenticated gateway-supervisor relationship.
 Config refresh, policy updates, credential delivery, log push, connect, exec,
 file sync, and relay setup are multiplexed over supervisor sessions. If a
